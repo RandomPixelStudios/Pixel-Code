@@ -1,0 +1,1310 @@
+//! Pixel-Code-Plugins (z.B. GitHub) und das Agent-Plugin "Pixel Code", das OpenCode und omp
+//! Zugriff darauf gibt. Beide Seiten teilen sich `~/.config/pixel-code/plugins.json`.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------- Registry
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Entry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub connected: bool,
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Programm, das der Agent über `pixelcode_plugin_run` aufrufen darf.
+    pub command: String,
+    /// Feste Argumente vor denen des Agents (z.B. der Pfad des Plugin-Skripts).
+    #[serde(default)]
+    pub prefix: Vec<String>,
+    pub usage: String,
+    /// Vom Nutzer eingetragene Werte (API-Keys, Pfade, ...); bekommt das Skript als PC_SETTINGS.
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+    /// Kurze Statuszeile für Einstellungen und Agent.
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Registry {
+    pub version: u32,
+    pub plugins: Vec<Entry>,
+}
+
+fn config_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("pixel-code")
+}
+
+pub fn registry_path() -> PathBuf {
+    config_dir().join("plugins.json")
+}
+
+pub fn load_registry() -> Registry {
+    std::fs::read_to_string(registry_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn update_entry(e: Entry) {
+    let mut reg = load_registry();
+    if reg.version < 2 {
+        // Bis v1 wurden Skript-Plugins automatisch eingeschaltet
+        for p in reg.plugins.iter_mut().filter(|p| p.id != "github") {
+            p.enabled = false;
+        }
+        reg.version = 2;
+    }
+    match reg.plugins.iter_mut().find(|p| p.id == e.id) {
+        // Schalter und Einstellungen des Nutzers behalten
+        Some(p) => *p = Entry { enabled: p.enabled, settings: std::mem::take(&mut p.settings), ..e },
+        None => reg.plugins.push(e),
+    }
+    save_registry(&reg);
+}
+
+pub fn save_registry(reg: &Registry) {
+    let _ = std::fs::create_dir_all(config_dir());
+    if let Ok(s) = serde_json::to_string_pretty(reg) {
+        let _ = std::fs::write(registry_path(), s);
+    }
+}
+
+pub fn set_enabled(id: &str, enabled: bool) {
+    let mut reg = load_registry();
+    if let Some(p) = reg.plugins.iter_mut().find(|p| p.id == id) {
+        p.enabled = enabled;
+        save_registry(&reg);
+    }
+}
+
+// ---------------------------------------------------------------- GitHub
+
+#[derive(Clone, PartialEq)]
+pub enum GhState {
+    Checking,
+    Disconnected,
+    Downloading,
+    /// Wartet auf die Bestätigung im Browser.
+    Code(String),
+    Connected(String),
+    Error(String),
+}
+
+#[derive(Clone)]
+pub struct GitHub {
+    pub state: Arc<Mutex<GhState>>,
+}
+
+impl GitHub {
+    pub fn new(ctx: eframe::egui::Context) -> Self {
+        let gh = Self { state: Arc::new(Mutex::new(GhState::Checking)) };
+        let s = gh.clone();
+        std::thread::spawn(move || {
+            s.refresh();
+            ctx.request_repaint();
+        });
+        gh
+    }
+
+    pub fn get(&self) -> GhState {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn set(&self, st: GhState) {
+        *self.state.lock().unwrap() = st;
+    }
+
+    fn refresh(&self) {
+        let login = gh_path().and_then(|gh| {
+            let out = Command::new(gh).args(["api", "user", "--jq", ".login"]).stdin(Stdio::null()).output().ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        });
+        let gh = gh_path().map(|p| p.display().to_string()).unwrap_or_else(|| managed_gh().display().to_string());
+        update_entry(Entry {
+            id: "github".into(),
+            name: "GitHub".into(),
+            description: "Repositories, pull requests, issues, releases and Actions via the GitHub CLI.".into(),
+            enabled: false,
+            connected: login.is_some(),
+            account: login.clone(),
+            command: gh,
+            prefix: Vec::new(),
+            settings: BTreeMap::new(),
+            status: login.as_ref().map_or("Not connected".into(), |l| format!("Connected as {l}")),
+            usage: "Arguments for the GitHub CLI (gh), e.g. 'repo view', 'pr create --fill', 'issue list', \
+                    'api repos/{owner}/{repo}'. Plain `git push/pull` is also authenticated once GitHub is connected."
+                .into(),
+        });
+        self.set(match login {
+            Some(l) => GhState::Connected(l),
+            None => GhState::Disconnected,
+        });
+    }
+
+    /// Lädt bei Bedarf die GitHub CLI herunter und startet die Anmeldung im Browser.
+    pub fn connect(&self, ctx: eframe::egui::Context) {
+        let s = self.clone();
+        std::thread::spawn(move || {
+            let res = s.do_connect(&ctx);
+            if let Err(e) = res {
+                s.set(GhState::Error(e));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_connect(&self, ctx: &eframe::egui::Context) -> Result<(), String> {
+        let gh = match gh_path() {
+            Some(p) => p,
+            None => {
+                self.set(GhState::Downloading);
+                ctx.request_repaint();
+                download_gh()?
+            }
+        };
+        let mut child = Command::new(&gh)
+            .args(["auth", "login", "--web", "-h", "github.com", "-p", "https", "--skip-ssh-key"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Could not start gh: {e}"))?;
+        let stderr = child.stderr.take().unwrap();
+        let mut log = String::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            log.push_str(&line);
+            log.push('\n');
+            if let Some(code) = find_code(&line) {
+                self.set(GhState::Code(code));
+                let _ = Command::new("xdg-open").arg("https://github.com/login/device").spawn();
+                ctx.request_repaint();
+            }
+        }
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err(log.lines().last().unwrap_or("GitHub login failed").to_string());
+        }
+        // Git selbst (push/pull über https) mit dem gh-Token verbinden
+        let _ = Command::new(&gh).args(["auth", "setup-git"]).output();
+        self.refresh();
+        set_enabled("github", true);
+        Ok(())
+    }
+
+    pub fn disconnect(&self, ctx: eframe::egui::Context) {
+        let s = self.clone();
+        std::thread::spawn(move || {
+            if let Some(gh) = gh_path() {
+                let _ = Command::new(gh).args(["auth", "logout", "-h", "github.com"]).stdin(Stdio::null()).output();
+            }
+            s.refresh();
+            ctx.request_repaint();
+        });
+    }
+}
+
+fn find_code(line: &str) -> Option<String> {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .find(|w| w.len() == 9 && w.as_bytes()[4] == b'-' && w.chars().all(|c| c == '-' || c.is_ascii_uppercase() || c.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+fn managed_gh() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pixel-code/bin/gh")
+}
+
+pub fn gh_path() -> Option<PathBuf> {
+    let managed = managed_gh();
+    if managed.is_file() {
+        return Some(managed);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join("gh"))
+        .find(|p| p.is_file())
+}
+
+/// Holt die aktuelle GitHub CLI von github.com/cli/cli (kein sudo nötig).
+fn download_gh() -> Result<PathBuf, String> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        a => return Err(format!("Unsupported architecture: {a}")),
+    };
+    let target = managed_gh();
+    let dir = target.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let script = format!(
+        "set -e; url=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+         | grep -o '\"browser_download_url\": \"[^\"]*linux_{arch}.tar.gz\"' | cut -d'\"' -f4); \
+         tmp=$(mktemp -d); curl -fsSL \"$url\" | tar xz -C \"$tmp\"; \
+         mv \"$tmp\"/gh_*/bin/gh '{}'; rm -rf \"$tmp\"",
+        target.display()
+    );
+    let out = Command::new("sh").args(["-c", &script]).output().map_err(|e| e.to_string())?;
+    if !out.status.success() || !target.is_file() {
+        return Err(format!("Downloading the GitHub CLI failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(target)
+}
+
+// ---------------------------------------------------------------- Skript-Plugins
+
+pub struct Field {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub secret: bool,
+}
+
+pub struct Def {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub usage: &'static str,
+    pub logo: (&'static str, &'static [u8]),
+    pub fields: &'static [Field],
+}
+
+const fn field(key: &'static str, label: &'static str, hint: &'static str, secret: bool) -> Field {
+    Field { key, label, hint, secret }
+}
+
+macro_rules! logo {
+    ($f:literal) => {
+        (concat!("bytes://", $f), include_bytes!(concat!("../assets/logos/", $f)) as &[u8])
+    };
+}
+
+/// Plugins, die als Node-Skript laufen (`assets/plugins/<id>.mjs`).
+pub const DEFS: &[Def] = &[
+    Def {
+        id: "websearch",
+        name: "Web Search",
+        description: "Private web search with a local SearXNG (runs in Docker, starts automatically).",
+        usage: "'search <query> [--n 8] [--time day|week|month|year] [--lang de]', 'fetch <url>' (page as text)",
+        logo: logo!("searxng.svg"),
+        fields: &[field("searxng", "SearXNG URL (optional)", "empty = local SearXNG on 127.0.0.1:8888", false)],
+    },
+    Def {
+        id: "blender",
+        name: "Blender",
+        description: "Control Blender through the Blender MCP add-on: inspect scenes, run Python, take screenshots.",
+        usage: "'scene', 'object <name>', 'exec <python>', 'exec-file <file.py>', 'screenshot [file]', 'raw <mcp command> [json]'",
+        logo: logo!("blender.svg"),
+        fields: &[field("host", "Host", "localhost", false), field("port", "Port", "9876", false)],
+    },
+    Def {
+        id: "unity",
+        name: "Unity",
+        description: "Run the Unity Editor in batch mode: editor methods, builds and tests.",
+        usage: "'method <Class.Method> [project]', 'build <Linux64|Windows64|OSX> <output> [project]', 'test [EditMode|PlayMode] [project]', 'open [project]'",
+        logo: logo!("unity.svg"),
+        fields: &[field("path", "Unity Editor path (optional)", "auto: ~/Unity/Hub/Editor/<newest>/Editor/Unity", false)],
+    },
+    Def {
+        id: "unreal",
+        name: "Unreal Engine",
+        description: "Run Unreal Editor commands, Python scripts and BuildCookRun.",
+        usage: "'python <Project.uproject> <script.py>', 'cmd <Project.uproject> [args]', 'build <Project.uproject> [Linux|Win64] [dir]', 'uat <args>', 'open <Project.uproject>'",
+        logo: logo!("unrealengine.svg"),
+        fields: &[field("engine", "Engine directory", "folder that contains Engine/, e.g. ~/UnrealEngine", false)],
+    },
+    Def {
+        id: "godot",
+        name: "Godot",
+        description: "Run, script, import and export Godot projects from the command line.",
+        usage: "'run [project]', 'script <file.gd> [project]', 'export <preset> <output> [project]', 'import [project]', or any godot arguments",
+        logo: logo!("godotengine.svg"),
+        fields: &[field("path", "Godot binary (optional)", "auto: godot4 / godot in PATH", false)],
+    },
+    Def {
+        id: "leonardo",
+        name: "Leonardo.ai",
+        description: "Generate images with Leonardo.ai and save them into the project.",
+        usage: "'generate <prompt> [--width 1024 --height 1024 --num 1 --model <id> --negative <text> --out dir]', 'models', 'status'",
+        logo: logo!("leonardo.png"),
+        fields: &[field("api_key", "API key", "from app.leonardo.ai > API Access", true)],
+    },
+    Def {
+        id: "telegram",
+        name: "Telegram",
+        description: "Control your agents from Telegram and get notified when they finish or need input.",
+        usage: "'send <text>' to message the user on Telegram",
+        logo: logo!("telegram.svg"),
+        fields: &[field("bot_token", "Bot token", "create a bot with @BotFather and paste its token", true)],
+    },
+    Def {
+        id: "gitlab",
+        name: "GitLab",
+        description: "Projects, issues, merge requests and pipelines on gitlab.com or your own GitLab.",
+        usage: "'projects', 'issues <group/project>', 'issue-create', 'mrs', 'mr-create', 'pipelines', 'raw'",
+        logo: logo!("gitlab.svg"),
+        fields: &[field("url", "GitLab URL", "https://gitlab.com", false), field("token", "Personal access token", "scope: api", true)],
+    },
+    Def {
+        id: "gitea",
+        name: "Gitea / Forgejo",
+        description: "Repositories, issues and pull requests on Codeberg, Gitea or Forgejo.",
+        usage: "'repos', 'issues <owner/repo>', 'issue-create', 'prs', 'pr-create', 'raw'",
+        logo: logo!("gitea.svg"),
+        fields: &[field("url", "Server URL", "https://codeberg.org", false), field("token", "Access token", "Settings > Applications", true)],
+    },
+    Def {
+        id: "docker",
+        name: "Docker",
+        description: "Containers, images, logs and compose on this machine.",
+        usage: "'ps', 'logs <name>', or any docker arguments ('compose up -d', 'build -t app .')",
+        logo: logo!("docker.svg"),
+        fields: &[],
+    },
+    Def {
+        id: "database",
+        name: "Database",
+        description: "Query PostgreSQL, MySQL/MariaDB or SQLite. Read-only unless you allow writes.",
+        usage: "'tables', 'schema <table>', 'query <sql>'",
+        logo: logo!("database.svg"),
+        fields: &[field("url", "Connection URL", "postgres://user:pass@host/db, mysql://..., or /path/to/file.sqlite", true), field("allow_writes", "Allow writes", "no / yes", false)],
+    },
+    Def {
+        id: "sentry",
+        name: "Sentry",
+        description: "Read production errors and stack traces so the agent can fix them.",
+        usage: "'projects', 'issues [project]', 'issue <id>', 'resolve <id>', 'raw'",
+        logo: logo!("sentry.svg"),
+        fields: &[field("org", "Organization slug", "the part after sentry.io/organizations/", false), field("token", "Auth token", "User settings > Auth Tokens", true), field("url", "Sentry URL (self-hosted)", "https://sentry.io", false)],
+    },
+    Def {
+        id: "vercel",
+        name: "Vercel",
+        description: "Deploy and inspect Vercel projects.",
+        usage: "'deployments', 'deploy [--prod]', 'logs <url>', 'cli <args>'",
+        logo: logo!("vercel.svg"),
+        fields: &[field("token", "Access token", "vercel.com/account/tokens", true)],
+    },
+    Def {
+        id: "netlify",
+        name: "Netlify",
+        description: "Deploy and inspect Netlify sites.",
+        usage: "'sites', 'deploys <site_id>', 'deploy [dir] [--prod]', 'cli <args>'",
+        logo: logo!("netlify.svg"),
+        fields: &[field("token", "Personal access token", "app.netlify.com > User settings > Applications", true)],
+    },
+    Def {
+        id: "cloudflare",
+        name: "Cloudflare",
+        description: "DNS records, Workers and Pages.",
+        usage: "'zones', 'dns <zone_id>', 'dns-add', 'wrangler <args>', 'raw'",
+        logo: logo!("cloudflare.svg"),
+        fields: &[field("token", "API token", "dash.cloudflare.com/profile/api-tokens", true)],
+    },
+    Def {
+        id: "ssh",
+        name: "SSH Servers",
+        description: "Run commands and copy files on your servers with your SSH keys.",
+        usage: "'hosts', 'run <host> <command>', 'copy <from> <to>'",
+        logo: logo!("ssh.svg"),
+        fields: &[field("hosts", "Hosts", "user@server, other-host (comma separated, from ~/.ssh/config)", false)],
+    },
+    Def {
+        id: "playwright",
+        name: "Browser (Playwright)",
+        description: "Open web pages in a real browser: screenshots, visible text, test scripts.",
+        usage: "'screenshot <url> [file] [--full]', 'text <url>', 'script <file.mjs>'",
+        logo: logo!("playwright.svg"),
+        fields: &[],
+    },
+    Def {
+        id: "comfyui",
+        name: "ComfyUI",
+        description: "Generate images with your local ComfyUI (Stable Diffusion, Flux, ...).",
+        usage: "'run <workflow_api.json> [--prompt ..] [--seed ..]', 'models', 'queue'",
+        logo: logo!("comfyui.svg"),
+        fields: &[field("url", "ComfyUI URL", "http://127.0.0.1:8188", false)],
+    },
+    Def {
+        id: "elevenlabs",
+        name: "ElevenLabs",
+        description: "Voice-overs and sound effects for games and videos.",
+        usage: "'speak <text> [--voice id] [--out file]', 'sfx <description>', 'voices'",
+        logo: logo!("elevenlabs.svg"),
+        fields: &[field("api_key", "API key", "elevenlabs.io > Profile > API keys", true)],
+    },
+    Def {
+        id: "meshy",
+        name: "Meshy",
+        description: "Text or image to textured 3D models (GLB/FBX/OBJ).",
+        usage: "'text <prompt> [--format glb]', 'image <file-or-url>'",
+        logo: logo!("meshy.svg"),
+        fields: &[field("api_key", "API key", "meshy.ai > Settings > API", true)],
+    },
+    Def {
+        id: "tripo",
+        name: "Tripo3D",
+        description: "Text or image to 3D models (GLB).",
+        usage: "'text <prompt>', 'image <file>'",
+        logo: logo!("tripo.svg"),
+        fields: &[field("api_key", "API key", "platform.tripo3d.ai > API keys", true)],
+    },
+    Def {
+        id: "gimp",
+        name: "GIMP",
+        description: "Convert, resize and batch-edit images with GIMP (no window).",
+        usage: "'convert <in> <out>', 'scale <in> <out> <w> <h>', 'batch <script-fu>'",
+        logo: logo!("gimp.svg"),
+        fields: &[field("path", "GIMP binary (optional)", "auto: gimp-console / gimp", false)],
+    },
+    Def {
+        id: "krita",
+        name: "Krita",
+        description: "Export Krita documents and animations.",
+        usage: "'export <file.kra> <out.png>', 'export-sequence', 'open'",
+        logo: logo!("krita.svg"),
+        fields: &[field("path", "Krita binary (optional)", "auto: krita", false)],
+    },
+    Def {
+        id: "resolve",
+        name: "DaVinci Resolve",
+        description: "Import media and render timelines in a running DaVinci Resolve (Studio).",
+        usage: "'info', 'import <files>', 'render [preset] [dir]', 'python <code>'",
+        logo: logo!("resolve.svg"),
+        fields: &[field("path", "Resolve install folder", "/opt/resolve", false)],
+    },
+    Def {
+        id: "itch",
+        name: "itch.io",
+        description: "Upload game builds to itch.io with butler.",
+        usage: "'push <folder> <user/game:channel> [version]', 'status-of <user/game>'",
+        logo: logo!("itch.svg"),
+        fields: &[field("api_key", "API key", "itch.io/user/settings/api-keys", true)],
+    },
+    Def {
+        id: "steam",
+        name: "Steam",
+        description: "Upload builds with steamcmd (Steamworks).",
+        usage: "'upload <app_build.vdf>', 'cmd <steamcmd commands>'",
+        logo: logo!("steam.svg"),
+        fields: &[field("username", "Steam build account", "", false), field("path", "steamcmd path (optional)", "auto", false)],
+    },
+    Def {
+        id: "discord",
+        name: "Discord",
+        description: "Control your agents from a Discord channel and get notified there.",
+        usage: "'send <text>', 'read [channel] [count]'",
+        logo: logo!("discord.svg"),
+        fields: &[field("bot_token", "Bot token", "discord.com/developers > Bot > Reset Token", true), field("channel_id", "Control channel id", "right-click the channel > Copy Channel ID", false)],
+    },
+    Def {
+        id: "slack",
+        name: "Slack",
+        description: "Post messages, read channels and upload files.",
+        usage: "'send [#channel] <text>', 'read [channel]', 'channels', 'upload <file>'",
+        logo: logo!("slack.svg"),
+        fields: &[field("bot_token", "Bot token", "xoxb-... from api.slack.com/apps > OAuth", true), field("channel", "Default channel id", "C0123...", false)],
+    },
+    Def {
+        id: "whatsapp",
+        name: "WhatsApp",
+        description: "Get messages from your agents on WhatsApp (Meta Cloud API).",
+        usage: "'send <text>'",
+        logo: logo!("whatsapp.svg"),
+        fields: &[field("token", "Access token", "developers.facebook.com > WhatsApp > API Setup", true), field("phone_number_id", "Phone number id", "shown on the API Setup page", false), field("to", "Your number", "e.g. 4915112345678", false)],
+    },
+    Def {
+        id: "email",
+        name: "E-Mail",
+        description: "Send e-mails with attachments over SMTP.",
+        usage: "'send <text> [--to ..] [--subject ..] [--attach files]'",
+        logo: logo!("email.svg"),
+        fields: &[field("smtp", "SMTP server", "smtp.gmail.com:465", false), field("user", "User / address", "you@gmail.com", false), field("password", "App password", "Gmail: myaccount.google.com/apppasswords", true), field("to", "Default recipient (optional)", "your own address", false)],
+    },
+    Def {
+        id: "ntfy",
+        name: "ntfy",
+        description: "Push notifications to your phone, no account needed.",
+        usage: "'send <text> [--title ..] [--priority high]'",
+        logo: logo!("ntfy.svg"),
+        fields: &[field("topic", "Topic", "a long secret name, e.g. pixelcode-x8k2...", false), field("server", "Server (optional)", "https://ntfy.sh", false)],
+    },
+    Def {
+        id: "notion",
+        name: "Notion",
+        description: "Search, read and write Notion pages.",
+        usage: "'search <query>', 'read <page_id>', 'append <page_id> <text>', 'create <parent> <title>', 'raw'",
+        logo: logo!("notion.svg"),
+        fields: &[field("token", "Integration secret", "notion.so/my-integrations", true)],
+    },
+    Def {
+        id: "obsidian",
+        name: "Obsidian",
+        description: "Read, search and write notes in your Obsidian vault.",
+        usage: "'list', 'search <text>', 'read <note>', 'write <note> <text>', 'append <note> <text>'",
+        logo: logo!("obsidian.svg"),
+        fields: &[field("vault", "Vault folder", "~/Documents/MyVault", false)],
+    },
+    Def {
+        id: "linear",
+        name: "Linear",
+        description: "Issues, comments and states in Linear.",
+        usage: "'teams', 'issues [TEAM]', 'issue <ABC-1>', 'create <TEAM> <title>', 'comment', 'state', 'gql'",
+        logo: logo!("linear.svg"),
+        fields: &[field("api_key", "Personal API key", "linear.app > Settings > Security & access", true)],
+    },
+    Def {
+        id: "jira",
+        name: "Jira",
+        description: "Search, create, comment and move Jira issues.",
+        usage: "'search [JQL]', 'issue <KEY-1>', 'create <PROJECT> <summary>', 'comment', 'move', 'raw'",
+        logo: logo!("jira.svg"),
+        fields: &[field("url", "Site URL", "https://yourteam.atlassian.net", false), field("email", "Account e-mail", "", false), field("token", "API token", "id.atlassian.com/manage-profile/security/api-tokens", true)],
+    },
+    Def {
+        id: "trello",
+        name: "Trello",
+        description: "Boards, lists and cards.",
+        usage: "'boards', 'lists <board>', 'cards <list>', 'add <list> <name>', 'move', 'comment'",
+        logo: logo!("trello.svg"),
+        fields: &[field("api_key", "API key", "trello.com/power-ups/admin > your Power-Up > API key", false), field("token", "Token", "generated next to the API key", true)],
+    },
+    Def {
+        id: "docs",
+        name: "Document Search",
+        description: "Search your local documents: Markdown, text, PDF, Word and ODT.",
+        usage: "'search <words>', 'read <file>', 'list'",
+        logo: logo!("docs.svg"),
+        fields: &[field("folders", "Folders", "~/Documents, ~/Notes (comma separated)", false)],
+    },
+    Def {
+        id: "homeassistant",
+        name: "Home Assistant",
+        description: "Control your smart home (lights, switches, scenes).",
+        usage: "'states [domain]', 'state <entity>', 'call <domain.service> [entity|json]'",
+        logo: logo!("homeassistant.svg"),
+        fields: &[field("url", "Home Assistant URL", "http://homeassistant.local:8123", false), field("token", "Long-lived access token", "Profile > Security > Long-lived access tokens", true)],
+    },
+    Def {
+        id: "modrinth",
+        name: "Modrinth",
+        description: "Upload Minecraft mod versions and manage your Modrinth projects.",
+        usage: "'projects', 'versions <project>', 'game-versions', 'upload <project> <file.jar> --version 1.2.0 --game-versions 1.21.1 --loaders fabric [--changelog ..] [--type release] [--deps id:required]', 'raw'",
+        logo: logo!("modrinth.svg"),
+        fields: &[field("token", "Personal access token", "modrinth.com/settings/pats (Create versions, Write projects)", true)],
+    },
+    Def {
+        id: "curseforge",
+        name: "CurseForge",
+        description: "Upload Minecraft mod files to CurseForge.",
+        usage: "'game-versions [filter]', 'upload <project_id> <file.jar> --game-versions 1.21.1 --loaders Fabric [--java 21] [--changelog ..] [--type release]'",
+        logo: logo!("curseforge.svg"),
+        fields: &[field("token", "Upload API token", "legacy.curseforge.com/account/api-tokens", true)],
+    },
+    Def {
+        id: "aws",
+        name: "AWS",
+        description: "Amazon Web Services through the AWS CLI: S3, EC2, Lambda, CloudWatch logs and everything else.",
+        usage: "any AWS CLI command, e.g. 's3 ls', 's3 sync dist s3://bucket', 'ec2 describe-instances', 'logs tail <group>'",
+        logo: logo!("aws.svg"),
+        fields: &[field("access_key_id", "Access key id", "IAM > Users > Security credentials > Create access key", false), field("secret_access_key", "Secret access key", "", true), field("region", "Region", "eu-central-1", false)],
+    },
+    Def {
+        id: "hetzner",
+        name: "Hetzner Cloud",
+        description: "Create, list and power Hetzner Cloud servers.",
+        usage: "'servers', 'power <id> on|off|reboot', 'create <name> [type] [image] [location]', 'delete <id>', 'raw'",
+        logo: logo!("hetzner.svg"),
+        fields: &[field("token", "API token", "console.hetzner.cloud > Project > Security > API tokens (Read & Write)", true)],
+    },
+    Def {
+        id: "digitalocean",
+        name: "DigitalOcean",
+        description: "Droplets and App Platform deployments.",
+        usage: "'droplets', 'power <id> on|off|reboot', 'apps', 'deploy <app_id>', 'raw'",
+        logo: logo!("digitalocean.svg"),
+        fields: &[field("token", "Personal access token", "cloud.digitalocean.com/account/api/tokens", true)],
+    },
+    Def {
+        id: "fly",
+        name: "Fly.io",
+        description: "Deploy and manage Fly.io apps with flyctl.",
+        usage: "any flyctl command, e.g. 'apps list', 'deploy', 'status -a app', 'logs -a app --no-tail'",
+        logo: logo!("fly.svg"),
+        fields: &[field("token", "Access token", "fly.io/user/personal_access_tokens (or: fly tokens create org)", true)],
+    },
+    Def {
+        id: "railway",
+        name: "Railway",
+        description: "Deploy and manage Railway projects with the Railway CLI.",
+        usage: "any Railway CLI command, e.g. 'status', 'up', 'logs', 'variables', 'redeploy'",
+        logo: logo!("railway.svg"),
+        fields: &[field("token", "Account token", "railway.com/account/tokens", true), field("project_token", "Project token (optional)", "Project > Settings > Tokens", true)],
+    },
+    Def {
+        id: "render",
+        name: "Render",
+        description: "Services, deploys and redeploys on Render.",
+        usage: "'services', 'deploys <service_id>', 'deploy <service_id> [clear]', 'raw'",
+        logo: logo!("render.svg"),
+        fields: &[field("api_key", "API key", "dashboard.render.com > Account settings > API keys", true)],
+    },
+    Def {
+        id: "heroku",
+        name: "Heroku",
+        description: "Apps, dynos, config vars and logs on Heroku.",
+        usage: "'apps', 'dynos <app>', 'restart <app>', 'config <app>', 'config-set <app> KEY=value', 'logs <app>', 'raw'",
+        logo: logo!("heroku.svg"),
+        fields: &[field("api_key", "API key", "dashboard.heroku.com/account > API Key", true)],
+    },
+    Def {
+        id: "linode",
+        name: "Akamai / Linode",
+        description: "Linode instances.",
+        usage: "'instances', 'power <id> on|off|reboot', 'raw'",
+        logo: logo!("linode.svg"),
+        fields: &[field("token", "Personal access token", "cloud.linode.com/profile/tokens", true)],
+    },
+    Def {
+        id: "vultr",
+        name: "Vultr",
+        description: "Vultr instances.",
+        usage: "'instances', 'power <id> on|off|reboot', 'raw'",
+        logo: logo!("vultr.svg"),
+        fields: &[field("api_key", "API key", "my.vultr.com/settings/#settingsapi (allow your IP)", true)],
+    },
+    Def {
+        id: "supabase",
+        name: "Supabase",
+        description: "Supabase projects, SQL queries and edge functions.",
+        usage: "'projects', 'sql <project_ref> <query>', 'functions <project_ref>', 'cli <args>', 'raw'",
+        logo: logo!("supabase.svg"),
+        fields: &[field("token", "Access token", "supabase.com/dashboard/account/tokens", true)],
+    },
+];
+
+const SCRIPTS: &[(&str, &str)] = &[
+    ("common.mjs", include_str!("../assets/plugins/common.mjs")),
+    ("websearch.mjs", include_str!("../assets/plugins/websearch.mjs")),
+    ("blender.mjs", include_str!("../assets/plugins/blender.mjs")),
+    ("unity.mjs", include_str!("../assets/plugins/unity.mjs")),
+    ("unreal.mjs", include_str!("../assets/plugins/unreal.mjs")),
+    ("godot.mjs", include_str!("../assets/plugins/godot.mjs")),
+    ("leonardo.mjs", include_str!("../assets/plugins/leonardo.mjs")),
+    ("telegram.mjs", include_str!("../assets/plugins/telegram.mjs")),
+    ("gitlab.mjs", include_str!("../assets/plugins/gitlab.mjs")),
+    ("gitea.mjs", include_str!("../assets/plugins/gitea.mjs")),
+    ("docker.mjs", include_str!("../assets/plugins/docker.mjs")),
+    ("database.mjs", include_str!("../assets/plugins/database.mjs")),
+    ("sentry.mjs", include_str!("../assets/plugins/sentry.mjs")),
+    ("vercel.mjs", include_str!("../assets/plugins/vercel.mjs")),
+    ("netlify.mjs", include_str!("../assets/plugins/netlify.mjs")),
+    ("cloudflare.mjs", include_str!("../assets/plugins/cloudflare.mjs")),
+    ("ssh.mjs", include_str!("../assets/plugins/ssh.mjs")),
+    ("playwright.mjs", include_str!("../assets/plugins/playwright.mjs")),
+    ("comfyui.mjs", include_str!("../assets/plugins/comfyui.mjs")),
+    ("elevenlabs.mjs", include_str!("../assets/plugins/elevenlabs.mjs")),
+    ("meshy.mjs", include_str!("../assets/plugins/meshy.mjs")),
+    ("tripo.mjs", include_str!("../assets/plugins/tripo.mjs")),
+    ("gimp.mjs", include_str!("../assets/plugins/gimp.mjs")),
+    ("krita.mjs", include_str!("../assets/plugins/krita.mjs")),
+    ("resolve.mjs", include_str!("../assets/plugins/resolve.mjs")),
+    ("itch.mjs", include_str!("../assets/plugins/itch.mjs")),
+    ("steam.mjs", include_str!("../assets/plugins/steam.mjs")),
+    ("discord.mjs", include_str!("../assets/plugins/discord.mjs")),
+    ("slack.mjs", include_str!("../assets/plugins/slack.mjs")),
+    ("whatsapp.mjs", include_str!("../assets/plugins/whatsapp.mjs")),
+    ("email.mjs", include_str!("../assets/plugins/email.mjs")),
+    ("ntfy.mjs", include_str!("../assets/plugins/ntfy.mjs")),
+    ("notion.mjs", include_str!("../assets/plugins/notion.mjs")),
+    ("obsidian.mjs", include_str!("../assets/plugins/obsidian.mjs")),
+    ("linear.mjs", include_str!("../assets/plugins/linear.mjs")),
+    ("jira.mjs", include_str!("../assets/plugins/jira.mjs")),
+    ("trello.mjs", include_str!("../assets/plugins/trello.mjs")),
+    ("docs.mjs", include_str!("../assets/plugins/docs.mjs")),
+    ("homeassistant.mjs", include_str!("../assets/plugins/homeassistant.mjs")),
+    ("modrinth.mjs", include_str!("../assets/plugins/modrinth.mjs")),
+    ("curseforge.mjs", include_str!("../assets/plugins/curseforge.mjs")),
+    ("aws.mjs", include_str!("../assets/plugins/aws.mjs")),
+    ("hetzner.mjs", include_str!("../assets/plugins/hetzner.mjs")),
+    ("digitalocean.mjs", include_str!("../assets/plugins/digitalocean.mjs")),
+    ("fly.mjs", include_str!("../assets/plugins/fly.mjs")),
+    ("railway.mjs", include_str!("../assets/plugins/railway.mjs")),
+    ("render.mjs", include_str!("../assets/plugins/render.mjs")),
+    ("heroku.mjs", include_str!("../assets/plugins/heroku.mjs")),
+    ("linode.mjs", include_str!("../assets/plugins/linode.mjs")),
+    ("vultr.mjs", include_str!("../assets/plugins/vultr.mjs")),
+    ("supabase.mjs", include_str!("../assets/plugins/supabase.mjs")),
+];
+
+fn scripts_dir() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pixel-code/plugins")
+}
+
+fn node() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if let Some(h) = dirs::home_dir() {
+        dirs.extend([h.join(".local/bin"), h.join(".bun/bin"), h.join(".volta/bin")]);
+    }
+    ["node", "bun"].iter().flat_map(|n| dirs.iter().map(move |d| d.join(n))).find(|p| p.is_file())
+}
+
+/// Prüft ein Skript-Plugin (`<script> status`) und schreibt das Ergebnis in die Registry.
+pub fn check(d: &Def) {
+    run_check(d, "status");
+}
+
+/// Verbindet ein Plugin (`<script> connect`, startet z.B. SearXNG). Gibt zurück, ob es klappt.
+pub fn connect(d: &Def) -> bool {
+    run_check(d, "connect");
+    let ok = load_registry().plugins.iter().any(|p| p.id == d.id && p.connected);
+    set_enabled(d.id, ok);
+    ok
+}
+
+/// Trennt ein Plugin: aus, und geheime Felder (API-Keys, Tokens) werden gelöscht.
+pub fn disconnect(d: &Def) {
+    let mut reg = load_registry();
+    if let Some(p) = reg.plugins.iter_mut().find(|p| p.id == d.id) {
+        p.enabled = false;
+        for f in d.fields.iter().filter(|f| f.secret) {
+            p.settings.remove(f.key);
+        }
+        if d.id == "telegram" {
+            p.settings.remove("chat_id");
+            p.settings.remove("paired_user");
+        }
+        // Gespeicherte Browser-Anmeldungen (Google, Microsoft) löschen
+        let _ = std::fs::remove_file(config_dir().join("tokens").join(format!("{}.json", d.id)));
+        save_registry(&reg);
+    }
+}
+
+fn run_check(d: &Def, action: &str) {
+    let settings = load_registry().plugins.into_iter().find(|p| p.id == d.id).map(|p| p.settings).unwrap_or_default();
+    let script = scripts_dir().join(format!("{}.mjs", d.id));
+    let (ok, status, command) = match node() {
+        None => (false, "Node.js is required for this plugin".to_string(), "node".to_string()),
+        Some(node) => {
+            let out = Command::new(&node)
+                .arg(&script)
+                .arg(action)
+                .env("PC_SETTINGS", serde_json::to_string(&settings).unwrap_or_default())
+                .stdin(Stdio::null())
+                .output();
+            let (ok, text) = match out {
+                Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).trim().to_string()),
+                Err(e) => (false, e.to_string()),
+            };
+            (ok, text.lines().next().unwrap_or("").to_string(), node.display().to_string())
+        }
+    };
+    update_entry(Entry {
+        id: d.id.into(),
+        name: d.name.into(),
+        description: d.description.into(),
+        // Neue Plugins sind aus, bis der Nutzer sie einschaltet
+        enabled: false,
+        connected: ok,
+        account: None,
+        command,
+        prefix: vec![script.display().to_string()],
+        usage: format!("Commands: {}. Run 'help' for details.", d.usage),
+        settings: BTreeMap::new(),
+        status,
+    });
+}
+
+/// Installiert die Plugin-Skripte und prüft alle Plugins im Hintergrund.
+pub fn refresh_all(ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let dir = scripts_dir();
+        for (name, content) in SCRIPTS {
+            write_if_changed(&dir.join(name), content);
+        }
+        for d in DEFS {
+            check(d);
+            ctx.request_repaint();
+        }
+    });
+}
+
+pub fn set_setting(id: &str, key: &str, value: &str) {
+    let mut reg = load_registry();
+    if let Some(p) = reg.plugins.iter_mut().find(|p| p.id == id) {
+        if value.is_empty() {
+            p.settings.remove(key);
+        } else {
+            p.settings.insert(key.into(), value.into());
+        }
+        save_registry(&reg);
+    }
+}
+
+pub fn setting(id: &str, key: &str) -> String {
+    load_registry().plugins.into_iter().find(|p| p.id == id).and_then(|p| p.settings.get(key).cloned()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- Agent-Plugin "Pixel Code"
+
+/// Gemeinsame Logik für OpenCode (JS) und omp (TS); läuft in beiden Fällen unter Bun.
+const CORE: &str = r#"
+import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const REGISTRY = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "pixel-code", "plugins.json");
+
+function pcLoad() {
+  try { return JSON.parse(readFileSync(REGISTRY, "utf8")); } catch { return { version: 1, plugins: [] }; }
+}
+
+function pcList() {
+  const reg = pcLoad();
+  if (!reg.plugins.length) return "No Pixel Code plugins are installed. The user can add them in Pixel Code > Settings > Plugins.";
+  return reg.plugins.map((p) => [
+    `## ${p.name} (id: ${p.id})`,
+    `status: ${p.enabled ? "enabled" : "disabled"}, ${p.connected ? "ready" : "not ready"}${p.status ? " - " + p.status : ""}`,
+    p.description,
+    `usage: ${p.usage}`,
+  ].join("\n")).join("\n\n");
+}
+
+// Zerlegt "pr create --title 'a b'" in Argumente (einfache Shell-Quotes).
+function pcSplit(s) {
+  const out = []; let cur = "", q = null, has = false;
+  for (const ch of String(s)) {
+    if (q) { if (ch === q) q = null; else cur += ch; }
+    else if (ch === "'" || ch === '"') { q = ch; has = true; }
+    else if (/\s/.test(ch)) { if (cur || has) out.push(cur); cur = ""; has = false; }
+    else cur += ch;
+  }
+  if (cur || has) out.push(cur);
+  return out;
+}
+
+function pcRun(id, args, cwd) {
+  if (!Array.isArray(args)) args = pcSplit(args ?? "");
+  const p = pcLoad().plugins.find((x) => x.id === id);
+  if (!p) return `Unknown plugin "${id}". Available: ${pcLoad().plugins.map((x) => x.id).join(", ") || "none"}`;
+  if (!p.enabled) return `Plugin "${id}" is disabled. Enable it with pixelcode_plugin_set first (ask the user).`;
+  const r = spawnSync(p.command, [...(p.prefix || []), ...(args || [])], {
+    cwd: cwd || process.cwd(), encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30 * 60 * 1000,
+    env: { ...process.env, GH_PROMPT_DISABLED: "1", NO_COLOR: "1", PC_SETTINGS: JSON.stringify(p.settings || {}) },
+  });
+  if (r.error) return `Failed to run ${p.command}: ${r.error.message}`;
+  const out = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
+  return `exit code ${r.status}\n${out}`.slice(0, 60000);
+}
+
+function pcSet(id, enabled) {
+  const reg = pcLoad();
+  const p = reg.plugins.find((x) => x.id === id);
+  if (!p) return `Unknown plugin "${id}".`;
+  p.enabled = !!enabled;
+  writeFileSync(REGISTRY, JSON.stringify(reg, null, 2));
+  return `${p.name} is now ${p.enabled ? "enabled" : "disabled"}.`;
+}
+
+const DESC = {
+  list: "List the Pixel Code plugins (GitHub, Blender, Unity, Unreal Engine, Godot, web search, Leonardo.ai, Telegram, ...) with their status and usage. Call this before using pixelcode_plugin_run.",
+  run: "Run a Pixel Code plugin command in the project directory, e.g. plugin 'github' with 'pr list', plugin 'websearch' with 'search rust egui', plugin 'blender' with 'exec <python>'. Run a plugin with 'help' to see all of its commands.",
+  set: "Enable or disable a Pixel Code plugin. Only do this when the user asks for it.",
+};
+"#;
+
+fn opencode_plugin() -> String {
+    format!(
+        r#"// @pixel-code-managed v{v} - generated by Pixel Code, will be overwritten on update.
+{CORE}
+// OpenCode 1.x: Hooks-Objekt mit Tools.
+async function legacy() {{
+  const {{ tool }} = await import("@opencode-ai/plugin");
+  return {{
+    tool: {{
+      pixelcode_plugins: tool({{ description: DESC.list, args: {{}}, async execute() {{ return pcList(); }} }}),
+      pixelcode_plugin_run: tool({{
+        description: DESC.run,
+        args: {{
+          plugin: tool.schema.string().describe("Plugin id, e.g. github"),
+          args: tool.schema.array(tool.schema.string()).describe("Arguments for the plugin command"),
+        }},
+        async execute(a, ctx) {{ return pcRun(a.plugin, a.args, ctx.directory); }},
+      }}),
+      pixelcode_plugin_set: tool({{
+        description: DESC.set,
+        args: {{ plugin: tool.schema.string(), enabled: tool.schema.boolean() }},
+        async execute(a) {{ return pcSet(a.plugin, a.enabled); }},
+      }}),
+    }},
+  }};
+}}
+
+// OpenCode 2.x: Tools über ctx.tool.transform (Namespace "pixelcode" -> pixelcode_plugins, ...).
+// Die Parameter-Schemas werden aus OpenCodes eigenen Tools abgeleitet: Schemas aus einer anderen
+// `effect`-Version erkennt OpenCodes Validierung nicht ("Invalid arguments ... Expected object").
+async function setup(ctx) {{
+  try {{
+    const tools = await ctx.tool.list();
+    const structs = tools.map((t) => t.input).filter((i) => i && typeof i.mapFields === "function" && i.fields);
+    const field = (tag) => {{
+      for (const id of ["edit", "grep", "shell", "read"]) {{
+        const f = tools.find((t) => t.id === id)?.input?.fields;
+        const hit = f && Object.values(f).find((v) => v?.ast?._tag === tag);
+        if (hit) return hit;
+      }}
+      for (const s of structs) {{
+        const hit = Object.values(s.fields).find((v) => v?.ast?._tag === tag);
+        if (hit) return hit;
+      }}
+    }};
+    const base = structs[0], Str = field("String"), Bool = field("Boolean");
+    if (!base || !Str || !Bool) throw new Error("no schema building blocks found");
+    const struct = (fields) => base.mapFields(() => fields);
+    const done = (text) => ({{ output: text, content: text }});
+    const dir = ctx?.location?.directory;
+    await ctx.tool.transform((draft) => {{
+      draft.add({{
+        name: "plugins", description: DESC.list, input: struct({{}}), output: Str,
+        options: {{ namespace: "pixelcode" }}, execute: async () => done(pcList()),
+      }});
+      draft.add({{
+        name: "plugin_run", description: DESC.run + " Pass the arguments as one string, e.g. 'pr list --state open'.",
+        input: struct({{ plugin: Str, args: Str }}), output: Str,
+        options: {{ namespace: "pixelcode" }}, execute: async (a) => done(pcRun(a.plugin, a.args, dir)),
+      }});
+      draft.add({{
+        name: "plugin_set", description: DESC.set,
+        input: struct({{ plugin: Str, enabled: Bool }}), output: Str,
+        options: {{ namespace: "pixelcode" }}, execute: async (a) => done(pcSet(a.plugin, a.enabled)),
+      }});
+    }});
+  }} catch (e) {{
+    console.warn("[pixel-code] could not register tools:", e);
+  }}
+  return async () => {{}};
+}}
+
+export default {{ id: "pixel-code", server: legacy, setup }};
+"#,
+        v = env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn package_json(desc: &str) -> String {
+    format!(
+        r#"{{
+  "name": "pixel-code",
+  "version": "{}",
+  "description": "{desc}",
+  "type": "module",
+  "main": "index",
+  "keywords": ["omp-plugin", "pi-package"],
+  "omp": {{ "extensions": ["./index.ts"] }},
+  "pi": {{ "extensions": ["./index.ts"] }}
+}}
+"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn omp_extension() -> String {
+    format!(
+        r#"// @pixel-code-managed v{v} - generated by Pixel Code, will be overwritten on update.
+{CORE}
+const text = (t: string) => ({{ content: [{{ type: "text", text: t }}], details: {{}} }});
+
+export default function (pi: any): void {{
+  pi.registerTool({{
+    name: "pixelcode_plugins",
+    label: "Pixel Code plugins",
+    description: DESC.list,
+    parameters: {{ type: "object", properties: {{}} }},
+    async execute() {{ return text(pcList()); }},
+  }});
+  pi.registerTool({{
+    name: "pixelcode_plugin_run",
+    label: "Pixel Code plugin",
+    description: DESC.run,
+    parameters: {{
+      type: "object",
+      properties: {{
+        plugin: {{ type: "string", description: "Plugin id, e.g. github" }},
+        args: {{ type: "array", items: {{ type: "string" }}, description: "Arguments for the plugin command" }},
+      }},
+      required: ["plugin", "args"],
+    }},
+    async execute(_id: string, p: any, _signal: any, _update: any, ctx: any) {{ return text(pcRun(p.plugin, p.args, ctx?.cwd)); }},
+  }});
+  pi.registerTool({{
+    name: "pixelcode_plugin_set",
+    label: "Pixel Code plugin switch",
+    description: DESC.set,
+    parameters: {{
+      type: "object",
+      properties: {{ plugin: {{ type: "string" }}, enabled: {{ type: "boolean" }} }},
+      required: ["plugin", "enabled"],
+    }},
+    async execute(_id: string, p: any) {{ return text(pcSet(p.plugin, p.enabled)); }},
+  }});
+}}
+"#,
+        v = env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn write_if_changed(path: &std::path::Path, content: &str) -> bool {
+    if std::fs::read_to_string(path).is_ok_and(|c| c == content) {
+        return false;
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(path, content).is_ok()
+}
+
+// ---------------------------------------------------------------- MCP-Server für alle anderen CLIs
+
+/// Kleiner MCP-Server (stdio, JSON-RPC) mit denselben Tools wie die OpenCode/omp-Plugins.
+fn mcp_server() -> String {
+    format!(
+        r#"// @pixel-code-managed v{v} - Pixel Code MCP server, generated by Pixel Code, will be overwritten on update.
+{CORE}
+import {{ createInterface }} from "node:readline";
+
+const TOOLS = [
+  {{ name: "pixelcode_plugins", description: DESC.list, inputSchema: {{ type: "object", properties: {{}} }} }},
+  {{
+    name: "pixelcode_plugin_run",
+    description: DESC.run + " Pass the arguments as one string, e.g. 'pr list --state open'.",
+    inputSchema: {{
+      type: "object",
+      properties: {{
+        plugin: {{ type: "string", description: "Plugin id, e.g. github" }},
+        args: {{ type: "string", description: "Arguments for the plugin command" }},
+        cwd: {{ type: "string", description: "Absolute project directory to run in (default: the current project)" }},
+      }},
+      required: ["plugin", "args"],
+    }},
+  }},
+  {{
+    name: "pixelcode_plugin_set",
+    description: DESC.set,
+    inputSchema: {{
+      type: "object",
+      properties: {{ plugin: {{ type: "string" }}, enabled: {{ type: "boolean" }} }},
+      required: ["plugin", "enabled"],
+    }},
+  }},
+];
+
+const send = (m) => process.stdout.write(JSON.stringify({{ jsonrpc: "2.0", ...m }}) + "\n");
+
+// Projektordner: vom Client über MCP "roots", sonst das Startverzeichnis
+let projectDir = process.env.PWD && process.env.PWD !== process.env.KIMI_PLUGIN_ROOT ? process.env.PWD : process.cwd();
+let clientRoots = false;
+const ROOTS_ID = "pixel-code-roots";
+const askRoots = () => clientRoots && send({{ id: ROOTS_ID, method: "roots/list" }});
+
+function call(name, a) {{
+  if (name === "pixelcode_plugins") return pcList();
+  if (name === "pixelcode_plugin_run") return pcRun(a.plugin, a.args, a.cwd || projectDir);
+  if (name === "pixelcode_plugin_set") return pcSet(a.plugin, a.enabled);
+  throw new Error(`Unknown tool ${{name}}`);
+}}
+
+createInterface({{ input: process.stdin }}).on("line", (line) => {{
+  let m;
+  try {{ m = JSON.parse(line); }} catch {{ return; }}
+  const {{ id, method, params }} = m;
+  if (id === ROOTS_ID) {{
+    const uri = m.result?.roots?.[0]?.uri;
+    if (uri?.startsWith("file://")) projectDir = decodeURIComponent(new URL(uri).pathname);
+    return;
+  }}
+  if (method === "notifications/initialized" || method === "notifications/roots/list_changed") {{
+    askRoots();
+    return;
+  }}
+  if (method === "initialize") {{
+    clientRoots = !!params?.capabilities?.roots;
+    send({{ id, result: {{ protocolVersion: params?.protocolVersion || "2025-06-18", capabilities: {{ tools: {{}} }}, serverInfo: {{ name: "pixel-code", version: "{v}" }} }} }});
+  }} else if (method === "tools/list") {{
+    send({{ id, result: {{ tools: TOOLS }} }});
+  }} else if (method === "tools/call") {{
+    try {{
+      send({{ id, result: {{ content: [{{ type: "text", text: String(call(params.name, params.arguments || {{}})) }}] }} }});
+    }} catch (e) {{
+      send({{ id, result: {{ content: [{{ type: "text", text: String(e.message || e) }}], isError: true }} }});
+    }}
+  }} else if (method === "ping") {{
+    send({{ id, result: {{}} }});
+  }} else if (id !== undefined) {{
+    send({{ id, error: {{ code: -32601, message: `Method not found: ${{method}}` }} }});
+  }}
+}});
+"#,
+        v = env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn mcp_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pixel-code/mcp/pixel-code-mcp.mjs")
+}
+
+/// Trägt den Server in einer JSON-Konfiguration unter `key.pixel-code` ein (andere Einträge bleiben).
+fn merge_json(path: &std::path::Path, key: &str, server: serde_json::Value) {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return, // Kaputte/kommentierte Datei nicht überschreiben
+        },
+        _ => serde_json::json!({}),
+    };
+    let Some(obj) = root.as_object_mut() else { return };
+    let servers = obj.entry(key).or_insert_with(|| serde_json::json!({}));
+    let Some(servers) = servers.as_object_mut() else { return };
+    if servers.get("pixel-code") == Some(&server) {
+        return;
+    }
+    servers.insert("pixel-code".into(), server);
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Kimi Code: als echtes Kimi-Plugin (erscheint unter /plugins > Installed).
+fn install_kimi_plugin(home: &std::path::Path) {
+    let kimi_home = std::env::var_os("KIMI_CODE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".kimi-code"));
+    let root = kimi_home.join("plugins/managed/pixel-code");
+    let manifest = serde_json::json!({
+        "name": "pixel-code",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Use your Pixel Code plugins (GitHub, web search, Blender, Modrinth, ...) from Kimi Code.",
+        "interface": {
+            "displayName": "Pixel Code",
+            "shortDescription": "Your Pixel Code plugins as tools",
+            "developerName": "Pixel Code"
+        },
+        "mcpServers": { "pixel-code": { "command": "node", "args": ["./pixel-code-mcp.mjs"] } }
+    });
+    write_if_changed(&root.join("pixel-code-mcp.mjs"), &mcp_server());
+    write_if_changed(&root.join("kimi.plugin.json"), &serde_json::to_string_pretty(&manifest).unwrap_or_default());
+
+    let installed_path = kimi_home.join("plugins/installed.json");
+    let mut installed: serde_json::Value = match std::fs::read_to_string(&installed_path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        Err(_) => serde_json::json!({ "version": 1, "plugins": [] }),
+    };
+    let Some(list) = installed["plugins"].as_array_mut() else { return };
+    if !list.iter().any(|p| p["id"] == "pixel-code") {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let iso = Command::new("date").args(["-u", "-d", &format!("@{now}"), "+%Y-%m-%dT%H:%M:%S.000Z"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let root_s = std::fs::canonicalize(&root).unwrap_or(root.clone()).display().to_string();
+        list.push(serde_json::json!({
+            "id": "pixel-code", "root": root_s, "source": "local-path", "enabled": true,
+            "installedAt": iso, "updatedAt": iso, "originalSource": root_s
+        }));
+        if let Ok(s) = serde_json::to_string_pretty(&installed) {
+            let _ = std::fs::write(&installed_path, s);
+        }
+    }
+    // Früheren Eintrag in mcp.json entfernen, sonst gäbe es die Tools doppelt
+    let mcp = kimi_home.join("mcp.json");
+    if let Ok(mut v) = std::fs::read_to_string(&mcp).map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap_or_default()) {
+        if v["mcpServers"].as_object_mut().and_then(|o| o.remove("pixel-code")).is_some() {
+            let _ = std::fs::write(&mcp, serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+    }
+}
+
+/// Registriert den Pixel-Code-MCP-Server bei einer CLI (über deren `mcp add` oder Konfigurationsdatei).
+fn install_mcp(agent: &str, bin: &str) {
+    let Some(home) = dirs::home_dir() else { return };
+    let Some(node) = node() else { return };
+    let script = mcp_path();
+    write_if_changed(&script, &mcp_server());
+    let (node_s, script_s) = (node.display().to_string(), script.display().to_string());
+    let stdio = serde_json::json!({ "command": node_s, "args": [script_s] });
+    let run = |args: &[&str]| {
+        Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    };
+    match agent {
+        "claude" => {
+            if !run(&["mcp", "get", "pixel-code"]) {
+                run(&["mcp", "add", "-s", "user", "pixel-code", "--", &node_s, &script_s]);
+            }
+        }
+        "codex" => {
+            if !run(&["mcp", "get", "pixel-code"]) {
+                run(&["mcp", "add", "pixel-code", "--", &node_s, &script_s]);
+            }
+        }
+        // Gemini CLI / Antigravity: "add" aktualisiert auch
+        "gemini" => {
+            run(&["mcp", "add", "pixel-code", &node_s, &script_s]);
+        }
+        "kimi" => install_kimi_plugin(&home),
+        "cursor" => merge_json(&home.join(".cursor/mcp.json"), "mcpServers", stdio),
+        "qwen" => merge_json(&home.join(".qwen/settings.json"), "mcpServers", stdio),
+        "copilot" => merge_json(
+            &home.join(".copilot/mcp-config.json"),
+            "mcpServers",
+            serde_json::json!({ "type": "local", "command": node_s, "args": [script_s], "tools": ["*"] }),
+        ),
+        "amp" => merge_json(&dirs::config_dir().unwrap_or(home.join(".config")).join("amp/settings.json"), "amp.mcpServers", stdio),
+        _ => {}
+    }
+}
+
+/// Installiert bzw. aktualisiert das "Pixel Code"-Plugin für OpenCode oder omp.
+/// Wird bei jedem Start des Agents aufgerufen, damit immer die aktuelle Version liegt.
+pub fn install_agent_plugin(agent: &str) {
+    let Some(home) = dirs::home_dir() else { return };
+    if let Some(bin) = crate::agents::get(agent).and_then(|a| a.bin) {
+        if !matches!(agent, "opencode" | "omp") {
+            let bin = crate::agents::resolve(bin).unwrap_or_else(|| bin.into());
+            let agent = agent.to_string();
+            std::thread::spawn(move || install_mcp(&agent, &bin));
+            return;
+        }
+    }
+    let desc = "Pixel Code: lets the agent use Pixel Code plugins (GitHub, ...)";
+    match agent {
+        "opencode" => {
+            // OpenCode 2 lädt Ordner aus plugins/ (und lädt sie bei Änderungen neu).
+            let dir = dirs::config_dir().unwrap_or(home.join(".config")).join("opencode/plugins");
+            let _ = std::fs::remove_file(dir.join("pixel-code.js"));
+            write_if_changed(&dir.join("pixel-code/index.js"), &opencode_plugin());
+            write_if_changed(&dir.join("pixel-code/package.json"), &package_json(desc).replace("./index.ts", "./index.js"));
+        }
+        "omp" => {
+            // Als echtes omp-Plugin verlinkt, damit es in `omp plugin list` erscheint.
+            let _ = std::fs::remove_file(home.join(".omp/agent/extensions/pixel-code.ts"));
+            let dir = dirs::data_dir().unwrap_or(home.join(".local/share")).join("pixel-code/agent-plugins/omp");
+            write_if_changed(&dir.join("index.ts"), &omp_extension());
+            let changed = write_if_changed(&dir.join("package.json"), &package_json(desc));
+            let lock = std::fs::read_to_string(home.join(".omp/plugins/omp-plugins.lock.json")).unwrap_or_default();
+            if changed || !lock.contains("pixel-code") {
+                std::thread::spawn(move || {
+                    let omp = crate::agents::get("omp").and_then(|a| a.bin).unwrap_or("omp");
+                    let _ = Command::new(omp).arg("plugin").arg("link").arg(&dir).stdin(Stdio::null()).output();
+                });
+            }
+        }
+        _ => {}
+    }
+}
