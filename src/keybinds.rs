@@ -19,6 +19,7 @@ pub enum Cmd {
     NextSession,
     PrevSession,
     AddProject,
+    ToggleFiles,
     Settings,
 }
 
@@ -35,6 +36,7 @@ impl Cmd {
         Cmd::NextSession,
         Cmd::PrevSession,
         Cmd::AddProject,
+        Cmd::ToggleFiles,
         Cmd::Settings,
     ];
 
@@ -51,6 +53,7 @@ impl Cmd {
             Cmd::NextSession => "Next session",
             Cmd::PrevSession => "Previous session",
             Cmd::AddProject => "Add project",
+            Cmd::ToggleFiles => "Show / hide files",
             Cmd::Settings => "Open settings",
         }
     }
@@ -59,7 +62,7 @@ impl Cmd {
         match self {
             Cmd::NewTerminal | Cmd::SplitRight | Cmd::SplitDown | Cmd::Close | Cmd::Maximize | Cmd::NextPane | Cmd::PrevPane => "Terminals",
             Cmd::NewSession | Cmd::NextSession | Cmd::PrevSession | Cmd::AddProject => "Sessions & projects",
-            Cmd::Settings => "App",
+            Cmd::ToggleFiles | Cmd::Settings => "App",
         }
     }
 
@@ -77,6 +80,7 @@ impl Cmd {
             Cmd::NextSession => (Modifiers::CTRL, Key::PageDown),
             Cmd::PrevSession => (Modifiers::CTRL, Key::PageUp),
             Cmd::AddProject => (cs, Key::O),
+            Cmd::ToggleFiles => (cs, Key::B),
             Cmd::Settings => (Modifiers::CTRL, Key::Comma),
         };
         Binding { mods: m, key: k }

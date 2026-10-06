@@ -21,6 +21,7 @@ pub enum Icon {
     Download,
     Reset,
     Check,
+    Files,
 }
 
 pub fn draw(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
@@ -114,6 +115,10 @@ pub fn draw(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
         Icon::Check => {
             line(vec2(-4.5, 0.0), vec2(-1.5, 3.0));
             line(vec2(-1.5, 3.0), vec2(4.5, -3.5));
+        }
+        Icon::Files => {
+            p.rect_stroke(Rect::from_center_size(c, vec2(13.0, 12.0)), 2.0, s, egui::StrokeKind::Middle);
+            line(vec2(1.5, -6.0), vec2(1.5, 6.0));
         }
         Icon::Server => {
             for dy in [-4.5, 4.5] {

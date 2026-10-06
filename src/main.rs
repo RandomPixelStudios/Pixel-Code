@@ -23,7 +23,32 @@ use serde::{Deserialize, Serialize};
 use terminal::{Status, Terminal};
 use theme::*;
 
+/// Aus dem Startmenü gestartet fehlt der PATH der Login-Shell (z.B. ~/.opencode/bin, ~/.kimi-code/bin).
+/// Holt ihn einmal beim Start, damit Agents gefunden werden und Terminals denselben PATH haben.
+fn import_login_path() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(shell)
+            .args(["-lic", "printf '__PC_PATH__%s__PC_PATH__' \"$PATH\""])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(out.ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()));
+    });
+    let login = rx.recv_timeout(Duration::from_secs(3)).ok().flatten().and_then(|s| s.split("__PC_PATH__").nth(1).map(str::to_string));
+    let mut dirs: Vec<PathBuf> = login.iter().flat_map(|p| std::env::split_paths(p).collect::<Vec<_>>()).collect();
+    dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        // SAFETY: läuft vor dem Start aller anderen Threads
+        unsafe { std::env::set_var("PATH", joined) };
+    }
+}
+
 fn main() -> eframe::Result {
+    import_login_path();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pixel Code")
@@ -126,6 +151,9 @@ struct Store {
     project: usize,
     session: usize,
     next_id: PaneId,
+    /// Rechte Sidebar mit den Dateien des Projekts
+    #[serde(default = "yes")]
+    files_open: bool,
 }
 
 fn state_file() -> PathBuf {
@@ -241,6 +269,10 @@ struct App {
     /// Wann der Nutzer ein Terminal zuletzt angesehen hat
     seen: HashMap<PaneId, Instant>,
     status_at: Option<Instant>,
+    sidebar_width: f32,
+    /// Datei-Sidebar: aufgeklappte Ordner und zwischengespeicherte Ordnerinhalte
+    files_expanded: std::collections::HashSet<PathBuf>,
+    files_cache: HashMap<PathBuf, (Instant, Vec<(String, bool)>)>,
 }
 
 impl App {
@@ -287,6 +319,9 @@ impl App {
             heur_done: HashMap::new(),
             seen: HashMap::new(),
             status_at: None,
+            sidebar_width: 330.0,
+            files_expanded: Default::default(),
+            files_cache: HashMap::new(),
         };
         // Alte Zustände vom letzten Start verwerfen
         let _ = std::fs::remove_dir_all(plugins::status_dir());
@@ -551,6 +586,10 @@ impl App {
                         self.select(self.store.project, s);
                     }
                 }
+                Cmd::ToggleFiles => {
+                    self.store.files_open ^= true;
+                    self.save();
+                }
                 Cmd::AddProject => self.modal = Some(Modal::Add(AddDialog::new())),
                 Cmd::Settings => self.open_settings(ctx, settings::Page::Plugins),
                 _ => {
@@ -568,7 +607,9 @@ impl App {
     }
 
     fn open_settings(&mut self, ctx: &egui::Context, page: settings::Page) {
-        self.settings = Some(settings::Settings::new(ctx, page, self.keybinds.clone(), self.updater.clone()));
+        let mut s = settings::Settings::new(ctx, page, self.keybinds.clone(), self.updater.clone());
+        s.nav_width = self.sidebar_width;
+        self.settings = Some(s);
     }
 
     // ---------------------------------------------------------------- Agent-Status
@@ -781,11 +822,8 @@ impl App {
         // Kopfzeile wie bei den Terminals: Name links, Aktionen rechts
         let head = Rect::from_min_size(card.min, vec2(card.width(), HEAD));
         ui.painter().line_segment([head.left_bottom() + vec2(1.0, 0.0), head.right_bottom() - vec2(1.0, 0.0)], Stroke::new(1.0, BORDER));
-        let mark = Rect::from_center_size(head.left_center() + vec2(22.0, 0.0), vec2(14.0, 14.0));
-        for (i, a) in [1.0, 0.55, 0.55, 0.25].iter().enumerate() {
-            let cell = Rect::from_min_size(mark.min + vec2((i % 2) as f32 * 7.5, (i / 2) as f32 * 7.5), vec2(6.5, 6.5));
-            ui.painter().rect_filled(cell, 1.5, ACCENT.gamma_multiply(*a));
-        }
+        let mark = Rect::from_center_size(head.left_center() + vec2(22.0, 0.0), vec2(18.0, 18.0));
+        egui::Image::from_bytes("bytes://app-icon.svg", APP_ICON_SVG).paint_at(ui, mark);
         ui.painter().text(head.left_center() + vec2(38.0, 0.0), egui::Align2::LEFT_CENTER, "Pixel Code", semibold(13.0), TEXT);
 
         let update = self.updater.available().is_some();
@@ -807,6 +845,11 @@ impl App {
         if btn(ui, Icon::Gear, settings_tip, update) {
             let page = if update { settings::Page::Update } else { settings::Page::Plugins };
             self.open_settings(ui.ctx(), page);
+        }
+        let files_tip = self.keybinds.tip(if self.store.files_open { "Hide files" } else { "Show files" }, Cmd::ToggleFiles);
+        if btn(ui, Icon::Files, files_tip, false) {
+            self.store.files_open ^= true;
+            self.save();
         }
         if btn(ui, Icon::Plus, self.keybinds.tip("Add project", Cmd::AddProject), false) {
             self.modal = Some(Modal::Add(AddDialog::new()));
@@ -1073,6 +1116,138 @@ impl App {
                         self.move_pane(id, None, Some(s));
                     }
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Datei-Sidebar
+
+    /// Inhalt eines Ordners (Ordner zuerst), höchstens alle 2 Sekunden neu gelesen.
+    fn list_dir(&mut self, dir: &std::path::Path) -> Vec<(String, bool)> {
+        if let Some((t, v)) = self.files_cache.get(dir) {
+            if t.elapsed() < Duration::from_secs(2) {
+                return v.clone();
+            }
+        }
+        let mut v: Vec<(String, bool)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().map(|t| t.is_dir()).unwrap_or(false)))
+                    .filter(|(n, _)| n != ".git")
+                    .take(2000)
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        self.files_cache.insert(dir.to_path_buf(), (Instant::now(), v.clone()));
+        v
+    }
+
+    fn file_rows(&mut self, dir: &std::path::Path, depth: usize, out: &mut Vec<(PathBuf, String, bool, usize)>) {
+        for (name, is_dir) in self.list_dir(dir) {
+            let path = dir.join(&name);
+            let open = is_dir && self.files_expanded.contains(&path);
+            out.push((path.clone(), name, is_dir, depth));
+            if open && out.len() < 5000 {
+                self.file_rows(&path, depth + 1, out);
+            }
+        }
+    }
+
+    fn files(&mut self, ui: &mut egui::Ui) {
+        let card = ui.max_rect();
+        ui.painter().rect(card, RADIUS, PANE, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        let head = Rect::from_min_size(card.min, vec2(card.width(), HEAD));
+        ui.painter().line_segment([head.left_bottom() + vec2(1.0, 0.0), head.right_bottom() - vec2(1.0, 0.0)], Stroke::new(1.0, BORDER));
+        let Some(p) = self.project() else { return };
+        let (pname, location) = (p.name.clone(), p.location.clone());
+        ui.painter().text(head.left_center() + vec2(14.0, 0.0), egui::Align2::LEFT_CENTER, "Files", semibold(13.0), TEXT);
+        ui.painter().with_clip_rect(Rect::from_min_max(head.min, pos2(head.right() - 70.0, head.bottom()))).text(
+            head.left_center() + vec2(56.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &pname,
+            font(12.0),
+            FAINT,
+        );
+        let mut x = head.right() - 20.0;
+        let mut btn = |ui: &mut egui::Ui, icon: Icon, tip: &str| {
+            let r = Rect::from_center_size(pos2(x, head.center().y), vec2(26.0, 26.0));
+            x -= 28.0;
+            let resp = ui.interact(r, ui.id().with(("files_btn", tip)), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, 6.0, HOVER);
+            }
+            icons::draw(ui.painter(), r.center(), icon, if resp.hovered() { TEXT } else { MUTED });
+            resp.on_hover_text(tip).clicked()
+        };
+        if btn(ui, Icon::Close, &self.keybinds.tip("Hide files", Cmd::ToggleFiles)) {
+            self.store.files_open = false;
+            self.save();
+        }
+        if btn(ui, Icon::Reset, "Refresh") {
+            self.files_cache.clear();
+        }
+
+        let body = Rect::from_min_max(pos2(card.left() + 6.0, head.bottom() + 6.0), card.max - vec2(6.0, 6.0));
+        let Location::Local(root) = location else {
+            ui.painter().text(body.center_top() + vec2(0.0, 24.0), egui::Align2::CENTER_CENTER, "Only available for local projects", font(12.5), FAINT);
+            return;
+        };
+        let mut rows = Vec::new();
+        self.file_rows(&root, 0, &mut rows);
+        let mut toggle = None;
+        let mut insert = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 24.0, rows.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (path, name, is_dir, depth) in &rows[range] {
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 6.0, HOVER);
+                    }
+                    let x0 = r.left() + 10.0 + *depth as f32 * 14.0;
+                    let c = pos2(x0 + 4.0, r.center().y);
+                    let col = if resp.hovered() { TEXT } else { MUTED };
+                    if *is_dir {
+                        let st = Stroke::new(1.2, FAINT);
+                        if self.files_expanded.contains(path) {
+                            ui.painter().line_segment([c + vec2(-3.0, -1.5), c + vec2(0.0, 1.5)], st);
+                            ui.painter().line_segment([c + vec2(0.0, 1.5), c + vec2(3.0, -1.5)], st);
+                        } else {
+                            ui.painter().line_segment([c + vec2(-1.5, -3.0), c + vec2(1.5, 0.0)], st);
+                            ui.painter().line_segment([c + vec2(1.5, 0.0), c + vec2(-1.5, 3.0)], st);
+                        }
+                        egui::Image::from_bytes("bytes://folder.svg", FOLDER_SVG)
+                            .tint(Color32::from_white_alpha(150))
+                            .paint_at(ui, Rect::from_center_size(pos2(x0 + 18.0, r.center().y), vec2(13.0, 13.0)));
+                    } else {
+                        let f = Rect::from_center_size(pos2(x0 + 18.0, r.center().y), vec2(9.0, 12.0));
+                        ui.painter().rect_stroke(f, 1.5, Stroke::new(1.1, FAINT), egui::StrokeKind::Middle);
+                    }
+                    ui.painter().with_clip_rect(r).text(pos2(x0 + 30.0, r.center().y), egui::Align2::LEFT_CENTER, name, font(12.5), col);
+                    if resp.double_clicked() && !*is_dir {
+                        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                    } else if resp.clicked() {
+                        if *is_dir {
+                            toggle = Some(path.clone());
+                        } else {
+                            insert = Some(path.clone());
+                        }
+                    }
+                    let tip = if *is_dir { "Click to open" } else { "Click to insert the path into the terminal · double-click to open" };
+                    resp.on_hover_text(tip);
+                }
+            });
+        });
+        if let Some(t) = toggle {
+            if !self.files_expanded.remove(&t) {
+                self.files_expanded.insert(t);
+            }
+        }
+        if let Some(path) = insert {
+            let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+            if let Some(t) = self.focused.and_then(|f| self.terms.get_mut(&f)) {
+                t.write(format!("{} ", shell_quote(&rel)).as_bytes());
             }
         }
     }
@@ -1928,6 +2103,7 @@ fn status_ring(p: &egui::Painter, c: egui::Pos2, status: Status, t: f64, r: f32)
     }
 }
 
+const APP_ICON_SVG: &[u8] = include_bytes!("../assets/icon.svg");
 const FOLDER_SVG: &[u8] = include_bytes!("../assets/logos/folder.svg");
 
 fn menu_item(ui: &mut egui::Ui, text: &str) -> bool {
@@ -2009,13 +2185,24 @@ impl eframe::App for App {
             self.shortcuts(&ctx);
         }
 
-        egui::Panel::left("sidebar")
+        let side = egui::Panel::left("sidebar")
             .resizable(true)
             .show_separator_line(false)
             .default_size(330.0)
             .size_range(280.0..=520.0)
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 10, right: 0, top: 10, bottom: 10 }))
             .show(ui, |ui| self.sidebar(ui));
+        self.sidebar_width = side.response.rect.width() - 10.0;
+
+        if self.store.files_open && self.project().is_some() {
+            egui::Panel::right("files")
+                .resizable(true)
+                .show_separator_line(false)
+                .default_size(280.0)
+                .size_range(200.0..=520.0)
+                .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 0, right: 10, top: 10, bottom: 10 }))
+                .show(ui, |ui| self.files(ui));
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(10))

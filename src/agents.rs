@@ -149,6 +149,11 @@ pub fn resolve(bin: &str) -> Option<String> {
         for d in [".local/bin", ".bun/bin", ".npm-global/bin", ".cargo/bin", ".deno/bin", ".volta/bin", "bin"] {
             dirs.push(h.join(d));
         }
+        // Eigene Installer legen nach ~/.<name>/bin (OpenCode: ~/.opencode/bin, Kimi: ~/.kimi-code/bin)
+        let name = bin.trim_end_matches("-agent").trim_end_matches("-cli");
+        for d in [format!(".{name}/bin"), format!(".{name}-code/bin"), format!(".{name}-cli/bin")] {
+            dirs.push(h.join(d));
+        }
     }
     dirs.iter().map(|d| d.join(bin)).find(|p| {
         p.metadata().map(|m| {

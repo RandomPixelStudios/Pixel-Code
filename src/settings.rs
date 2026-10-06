@@ -23,6 +23,8 @@ enum Sort {
 
 pub struct Settings {
     pub page: Page,
+    /// Breite der Navigation = Breite der Sidebar der App
+    pub nav_width: f32,
     github: GitHub,
     registry: plugins::Registry,
     loaded: Option<std::time::Instant>,
@@ -52,6 +54,7 @@ impl Settings {
         plugins::refresh_all(ctx.clone());
         Self {
             page,
+            nav_width: 330.0,
             github: GitHub::new(ctx.clone()),
             registry: plugins::load_registry(),
             loaded: None,
@@ -92,7 +95,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Settings) -> bool {
 
     egui::Panel::left("settings_nav")
         .resizable(false)
-        .exact_size(270.0)
+        .exact_size(s.nav_width)
         .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin { left: 10, right: 0, top: 10, bottom: 10 }))
         .show(ui, |ui| {
             let card = ui.max_rect();
