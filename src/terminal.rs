@@ -18,6 +18,8 @@ pub struct Terminal {
     scroll: usize,
     scroll_acc: f32,
     pub shell_name: String,
+    /// Markierter Text: Anker und Ende als (Zeile, Spalte) im sichtbaren Bildschirm
+    selection: Option<((u16, u16), (u16, u16))>,
     #[allow(dead_code)]
     last_output: Arc<Mutex<Instant>>,
     last_input: Instant,
@@ -121,7 +123,7 @@ impl Terminal {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shell".into());
 
-        Ok(Self { parser, writer, master: pair.master, child, alive, size, scroll: 0, scroll_acc: 0.0, shell_name, last_output, last_input: Instant::now() })
+        Ok(Self { parser, writer, master: pair.master, child, alive, size, scroll: 0, scroll_acc: 0.0, shell_name, selection: None, last_output, last_input: Instant::now() })
     }
 
     /// Zeitpunkt der letzten Eingabe des Nutzers.
@@ -143,7 +145,25 @@ impl Terminal {
             .unwrap_or_else(|| self.shell_name.clone())
     }
 
+    /// Markierter Text, falls etwas markiert ist.
+    pub fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        if a == b {
+            return None;
+        }
+        let text = self.parser.lock().unwrap().screen().contents_between(a.0, a.1, b.0, b.1 + 1);
+        Some(text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Schreibt an das Programm, ohne Scroll-Position und Markierung anzufassen.
+    fn write_raw(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
+        self.selection = None;
         if self.scroll != 0 {
             self.scroll = 0;
             self.parser.lock().unwrap().screen_mut().set_scrollback(0);
@@ -212,7 +232,31 @@ impl Terminal {
         let rows = ((inner.height() / ch).floor() as u16).max(1);
         self.resize(rows, cols);
 
-        let response = ui.interact(rect, id, egui::Sense::click());
+        let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+        let cell_at = |p: egui::Pos2| -> (u16, u16) {
+            let c = ((p.x - inner.left()) / cw).floor().clamp(0.0, cols as f32 - 1.0) as u16;
+            let r = ((p.y - inner.top()) / ch).floor().clamp(0.0, rows as f32 - 1.0) as u16;
+            (r, c)
+        };
+        // Text markieren (wie in anderen Linux-Terminals: beim Loslassen kopieren)
+        if response.drag_started() {
+            if let Some(p) = response.interact_pointer_pos() {
+                self.selection = Some((cell_at(p), cell_at(p)));
+            }
+        } else if response.dragged() {
+            if let (Some(p), Some(sel)) = (response.interact_pointer_pos(), self.selection.as_mut()) {
+                sel.1 = cell_at(p);
+            }
+        } else if response.drag_stopped() {
+            if let Some(text) = self.selected_text().filter(|t| !t.trim().is_empty()) {
+                ui.ctx().copy_text(text);
+            }
+        } else if response.clicked() {
+            self.selection = None;
+        }
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
         if focused {
             ui.memory_mut(|m| {
                 m.request_focus(id);
@@ -229,10 +273,39 @@ impl Terminal {
             let lines = (self.scroll_acc / ch).trunc() as i64;
             if lines != 0 {
                 self.scroll_acc -= lines as f32 * ch;
-                let mut p = self.parser.lock().unwrap();
-                let new = (self.scroll as i64 + lines).max(0) as usize;
-                p.screen_mut().set_scrollback(new);
-                self.scroll = p.screen().scrollback();
+                let (mode, enc, alt, app_cursor) = {
+                    let p = self.parser.lock().unwrap();
+                    let s = p.screen();
+                    (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), s.alternate_screen(), s.application_cursor())
+                };
+                let pos = ui.input(|i| i.pointer.hover_pos()).map(cell_at).unwrap_or((0, 0));
+                let up = lines > 0;
+                let n = lines.unsigned_abs().min(10) as usize;
+                if mode != vt100::MouseProtocolMode::None {
+                    // Programm will Mausereignisse (Claude Code, vim, less, ...): Mausrad melden
+                    let button = if up { 64u8 } else { 65 };
+                    let (r, c) = (pos.0 + 1, pos.1 + 1);
+                    let one = match enc {
+                        vt100::MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{c};{r}M").into_bytes(),
+                        _ => vec![0x1b, b'[', b'M', 32 + button, (32 + c.min(222)) as u8, (32 + r.min(222)) as u8],
+                    };
+                    self.write_raw(&one.repeat(n));
+                } else if alt {
+                    // Vollbild-Programm ohne Maus: Pfeiltasten schicken
+                    let key: &[u8] = match (up, app_cursor) {
+                        (true, true) => b"\x1bOA",
+                        (true, false) => b"\x1b[A",
+                        (false, true) => b"\x1bOB",
+                        (false, false) => b"\x1b[B",
+                    };
+                    self.write_raw(&key.repeat(n));
+                } else {
+                    let mut p = self.parser.lock().unwrap();
+                    let new = (self.scroll as i64 + lines).max(0) as usize;
+                    p.screen_mut().set_scrollback(new);
+                    self.scroll = p.screen().scrollback();
+                    self.selection = None;
+                }
             }
         }
 
@@ -242,6 +315,18 @@ impl Terminal {
         let (srows, scols) = screen.size();
         let default_fg = egui::Color32::from_rgb(0xd4, 0xd4, 0xd4);
 
+        if let Some((a, b)) = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) }) {
+            let col = egui::Color32::from_rgba_unmultiplied(120, 140, 200, 90);
+            for r in a.0..=b.0.min(srows.saturating_sub(1)) {
+                let c0 = if r == a.0 { a.1 } else { 0 };
+                let c1 = if r == b.0 { b.1 + 1 } else { scols };
+                if c1 > c0 {
+                    let y = inner.top() + r as f32 * ch;
+                    let x = inner.left() + c0 as f32 * cw;
+                    painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2((c1 - c0) as f32 * cw, ch)), 0.0, col);
+                }
+            }
+        }
         for r in 0..srows {
             let y = inner.top() + r as f32 * ch;
             let mut job = egui::text::LayoutJob::default();
@@ -324,7 +409,14 @@ impl Terminal {
                         out.extend_from_slice(t.as_bytes());
                     }
                 }
-                egui::Event::Copy => out.push(0x03),
+                // Mit Markierung kopiert Ctrl+C (bzw. Ctrl+Shift+C), sonst ist es ^C für das Programm
+                egui::Event::Copy => match self.selected_text() {
+                    Some(t) => {
+                        ui.ctx().copy_text(t);
+                        self.selection = None;
+                    }
+                    None => out.push(0x03),
+                },
                 egui::Event::Cut => out.push(0x18),
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if let Some(b) = key_bytes(key, modifiers, app_cursor) {
