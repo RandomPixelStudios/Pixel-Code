@@ -84,3 +84,35 @@ export async function rawCall(base, headers, list) {
   if (!method || !path) fail("Usage: raw <GET|POST|PUT|PATCH|DELETE> <path> [json body]");
   print(await http(method.toUpperCase(), path.startsWith("http") ? path : base + path, { headers, body: json.length ? JSON.parse(json.join(" ")) : undefined }));
 }
+
+// ---------------------------------------------------------------- CLI-Plugins
+
+/** Plugin, das ein Kommandozeilenprogramm durchreicht: status/connect prüfen, sonst Argumente weitergeben. */
+export function cliPlugin({ bins, name, version = ["--version"], help, env = {}, prefix = [] }) {
+  const bin = which(bins);
+  const [cmd] = args;
+  for (const [k, v] of Object.entries(env)) if (v) process.env[k] = v;
+  if (cmd === "status" || cmd === "connect") {
+    if (!bin) fail(`${name} is not installed (${bins[0]} not found).`);
+    const r = spawnSync(bin, version, { encoding: "utf8" });
+    console.log(`${name} ${((r.stdout || r.stderr || "").trim().split("\n")[0] || "").slice(0, 80)}`.trim());
+    process.exit(0);
+  }
+  if (!cmd || cmd === "help") {
+    console.log(help);
+    process.exit(0);
+  }
+  if (!bin) fail(`${name} is not installed (${bins[0]} not found).`);
+  passthrough(bin, [...prefix, ...args]);
+}
+
+/** Einfaches REST-Plugin: `raw <METHOD> </path> [json]` plus eigene Befehle. */
+export async function restPlugin({ base, headers = {}, need, commands = {}, help, status }) {
+  const [cmd, ...rest] = args;
+  if (cmd && cmd !== "help" && need && !need.every(Boolean)) fail("Plugin is not configured. Fill in the fields in Pixel Code > Settings > Plugins.");
+  const req = (method, path, body) => http(method, path.startsWith("http") ? path : base + path, { headers, body });
+  if (cmd === "status" || cmd === "connect") { console.log(await status(req)); return; }
+  if (cmd === "raw") { print(await req(rest[0] || "GET", rest[1] || "/", rest[2] ? JSON.parse(rest.slice(2).join(" ")) : undefined)); return; }
+  if (commands[cmd]) { const out = await commands[cmd](req, rest); if (out !== undefined) print(out); return; }
+  console.log(help + "\n  raw <METHOD> </path> [json]");
+}

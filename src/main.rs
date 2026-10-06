@@ -151,9 +151,9 @@ struct Store {
     project: usize,
     session: usize,
     next_id: PaneId,
-    /// Rechte Sidebar mit den Dateien des Projekts
-    #[serde(default = "yes")]
-    files_open: bool,
+    /// Rechte Sidebar mit den Dateien des Projekts (standardmäßig zu)
+    #[serde(default)]
+    files_visible: bool,
 }
 
 fn state_file() -> PathBuf {
@@ -587,7 +587,7 @@ impl App {
                     }
                 }
                 Cmd::ToggleFiles => {
-                    self.store.files_open ^= true;
+                    self.store.files_visible ^= true;
                     self.save();
                 }
                 Cmd::AddProject => self.modal = Some(Modal::Add(AddDialog::new())),
@@ -846,9 +846,9 @@ impl App {
             let page = if update { settings::Page::Update } else { settings::Page::Plugins };
             self.open_settings(ui.ctx(), page);
         }
-        let files_tip = self.keybinds.tip(if self.store.files_open { "Hide files" } else { "Show files" }, Cmd::ToggleFiles);
+        let files_tip = self.keybinds.tip(if self.store.files_visible { "Hide files" } else { "Show files" }, Cmd::ToggleFiles);
         if btn(ui, Icon::Files, files_tip, false) {
-            self.store.files_open ^= true;
+            self.store.files_visible ^= true;
             self.save();
         }
         if btn(ui, Icon::Plus, self.keybinds.tip("Add project", Cmd::AddProject), false) {
@@ -1156,6 +1156,8 @@ impl App {
 
     fn files(&mut self, ui: &mut egui::Ui) {
         let card = ui.max_rect();
+        // Ganze Fläche belegen, sonst springt das Panel nach dem Ziehen auf die Inhaltsbreite zurück
+        ui.expand_to_include_rect(card);
         ui.painter().rect(card, RADIUS, PANE, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
         let head = Rect::from_min_size(card.min, vec2(card.width(), HEAD));
         ui.painter().line_segment([head.left_bottom() + vec2(1.0, 0.0), head.right_bottom() - vec2(1.0, 0.0)], Stroke::new(1.0, BORDER));
@@ -1181,7 +1183,7 @@ impl App {
             resp.on_hover_text(tip).clicked()
         };
         if btn(ui, Icon::Close, &self.keybinds.tip("Hide files", Cmd::ToggleFiles)) {
-            self.store.files_open = false;
+            self.store.files_visible = false;
             self.save();
         }
         if btn(ui, Icon::Reset, "Refresh") {
@@ -2194,7 +2196,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.sidebar(ui));
         self.sidebar_width = side.response.rect.width() - 10.0;
 
-        if self.store.files_open && self.project().is_some() {
+        if self.store.files_visible && self.project().is_some() {
             egui::Panel::right("files")
                 .resizable(true)
                 .show_separator_line(false)
