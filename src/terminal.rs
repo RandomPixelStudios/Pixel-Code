@@ -23,18 +23,48 @@ pub struct Terminal {
     last_input: Instant,
 }
 
-/// Grober Zustand eines Agents, abgeleitet aus Ausgabe und Bildschirminhalt.
-#[derive(Clone, Copy, PartialEq)]
+/// Zustand eines Agents: vom Pixel-Code-Plugin/Hook gemeldet, sonst aus dem Bildschirm geschätzt.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Status {
     Idle,
     Working,
+    /// Der Agent stellt eine Frage.
     Question,
+    /// Der Agent wartet auf eine Freigabe (Befehl ausführen, Datei ändern, ...).
+    Permission,
+    /// Fertig, aber noch nicht angesehen.
+    Done,
     Error,
+}
+
+impl Status {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "idle" => Status::Idle,
+            "working" => Status::Working,
+            "question" => Status::Question,
+            "permission" => Status::Permission,
+            "done" => Status::Done,
+            "error" => Status::Error,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Idle => "Idle",
+            Status::Working => "Working",
+            Status::Question => "Question",
+            Status::Permission => "Permission",
+            Status::Done => "Done",
+            Status::Error => "Error",
+        }
+    }
 }
 
 impl Terminal {
     /// Startet die Login-Shell in `cwd`, oder `argv` (z.B. ssh), falls angegeben.
-    pub fn spawn(cwd: &Path, argv: Option<&[String]>, ctx: egui::Context) -> anyhow_lite::Result<Self> {
+    pub fn spawn(cwd: &Path, argv: Option<&[String]>, pane: u64, ctx: egui::Context) -> anyhow_lite::Result<Self> {
         let size = (24u16, 80u16);
         let pty = native_pty_system();
         let pair = pty
@@ -53,6 +83,9 @@ impl Terminal {
         cmd.cwd(if cwd.is_dir() { cwd.to_path_buf() } else { dirs::home_dir().unwrap_or_default() });
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Für die Status-Hooks des Pixel-Code-Plugins
+        cmd.env("PIXEL_CODE_PANE", pane.to_string());
+        cmd.env("PIXEL_CODE_STATUS_DIR", crate::plugins::status_dir());
         let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
         drop(pair.slave);
 
@@ -91,6 +124,11 @@ impl Terminal {
         Ok(Self { parser, writer, master: pair.master, child, alive, size, scroll: 0, scroll_acc: 0.0, shell_name, last_output, last_input: Instant::now() })
     }
 
+    /// Zeitpunkt der letzten Eingabe des Nutzers.
+    pub fn last_input(&self) -> Instant {
+        self.last_input
+    }
+
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
@@ -124,14 +162,18 @@ impl Terminal {
         let text = self.parser.lock().unwrap().screen().contents();
         let lines: Vec<String> = text.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect();
         let tail = |n: usize| lines[lines.len().saturating_sub(n)..].to_vec();
-        const ASK: &[&str] = &[
-            "do you want to", "would you like to", "(y/n)", "[y/n]", "allow command", "allow this",
-            "approve", "❯ 1. yes", "› 1. yes", "yes, and don't ask", "press enter to confirm",
+        const PERMIT: &[&str] = &[
+            "do you want to proceed", "do you want to make this edit", "do you want to create", "do you want to run",
+            "allow command", "allow this", "allow once", "approve", "yes, and don't ask", "permission",
         ];
+        const ASK: &[&str] = &["would you like to", "do you want to", "(y/n)", "[y/n]", "❯ 1.", "› 1.", "press enter to confirm", "type something"];
         const ERR: &[&str] = &["api error", "error:", "fatal:", "panicked", "✗ "];
         let t = tail(14);
         // Claude, Codex & Co. zeigen beim Arbeiten "esc to interrupt" an.
         let interrupt = t.iter().any(|l| l.contains("to interrupt") || l.contains("esc interrupt") || l.contains("esc to cancel"));
+        if !interrupt && t.iter().any(|l| PERMIT.iter().any(|k| l.contains(k))) {
+            return Status::Permission;
+        }
         if !interrupt && t.iter().any(|l| ASK.iter().any(|k| l.contains(k))) {
             return Status::Question;
         }

@@ -16,6 +16,11 @@ pub enum Icon {
     Folder,
     Server,
     Dots,
+    Plug,
+    Keyboard,
+    Download,
+    Reset,
+    Check,
 }
 
 pub fn draw(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
@@ -79,6 +84,36 @@ pub fn draw(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
             for dx in [-5.0, 0.0, 5.0] {
                 p.circle_filled(c + vec2(dx, 0.0), 1.4, col);
             }
+        }
+        Icon::Plug => {
+            p.rect_stroke(Rect::from_center_size(c + vec2(0.0, -0.5), vec2(10.0, 7.0)), 2.0, s, egui::StrokeKind::Middle);
+            line(vec2(-2.5, -4.0), vec2(-2.5, -7.0));
+            line(vec2(2.5, -4.0), vec2(2.5, -7.0));
+            line(vec2(0.0, 3.0), vec2(0.0, 7.0));
+        }
+        Icon::Keyboard => {
+            p.rect_stroke(Rect::from_center_size(c, vec2(15.0, 10.0)), 2.0, s, egui::StrokeKind::Middle);
+            for dx in [-4.0, 0.0, 4.0] {
+                p.circle_filled(c + vec2(dx, -1.8), 0.9, col);
+            }
+            line(vec2(-3.5, 2.2), vec2(3.5, 2.2));
+        }
+        Icon::Download => {
+            line(vec2(0.0, -6.0), vec2(0.0, 3.0));
+            line(vec2(-3.5, -0.5), vec2(0.0, 3.0));
+            line(vec2(3.5, -0.5), vec2(0.0, 3.0));
+            line(vec2(-6.0, 6.0), vec2(6.0, 6.0));
+        }
+        Icon::Reset => {
+            let pts: Vec<Pos2> = (0..=20).map(|k| c + egui::Vec2::angled(-2.2 + k as f32 / 20.0 * 4.9) * 5.0).collect();
+            let tip = pts[0];
+            p.add(egui::Shape::line(pts, s));
+            p.line_segment([tip, tip + vec2(0.5, -3.2)], s);
+            p.line_segment([tip, tip + vec2(3.2, 0.3)], s);
+        }
+        Icon::Check => {
+            line(vec2(-4.5, 0.0), vec2(-1.5, 3.0));
+            line(vec2(-1.5, 3.0), vec2(4.5, -3.5));
         }
         Icon::Server => {
             for dy in [-4.5, 4.5] {

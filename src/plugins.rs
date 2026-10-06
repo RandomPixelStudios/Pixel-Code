@@ -1,5 +1,6 @@
-//! Pixel-Code-Plugins (z.B. GitHub) und das Agent-Plugin "Pixel Code", das OpenCode und omp
-//! Zugriff darauf gibt. Beide Seiten teilen sich `~/.config/pixel-code/plugins.json`.
+//! Pixel-Code-Plugins (GitHub, ioBroker, ...) und das Agent-Plugin "Pixel Code", das allen unterstützten
+//! CLIs Zugriff darauf gibt und ihren Zustand (arbeitet, Frage, Freigabe, fertig) an die App meldet.
+//! Beide Seiten teilen sich `~/.config/pixel-code/plugins.json`.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -685,8 +686,80 @@ pub const DEFS: &[Def] = &[
         usage: "'projects', 'sql <project_ref> <query>', 'functions <project_ref>', 'cli <args>', 'raw'",
         logo: logo!("supabase.svg"),
         fields: &[field("token", "Access token", "supabase.com/dashboard/account/tokens", true)],
+    },    Def {
+        id: "iobroker",
+        name: "ioBroker",
+        description: "Read and switch ioBroker states (lights, sensors, scripts) through the simple-api adapter.",
+        usage: "'states [pattern]', 'get <id>', 'value <id>', 'set <id> <value>', 'toggle <id>', 'objects [pattern]', 'search <text>', 'rooms', 'functions'",
+        logo: logo!("iobroker.svg"),
+        fields: &[field("url", "simple-api URL", "http://iobroker.local:8087", false), field("user", "User (optional)", "only if authentication is enabled", false), field("password", "Password (optional)", "", true)],
+    },
+    Def {
+        id: "ollama",
+        name: "Ollama",
+        description: "Ask local LLMs running in Ollama, list and pull models.",
+        usage: "'models', 'running', 'ask <prompt> [--model m]', 'embed <text>', 'pull <model>'",
+        logo: logo!("ollama.svg"),
+        fields: &[field("url", "Ollama URL", "http://127.0.0.1:11434", false), field("model", "Default model (optional)", "e.g. llama3.2", false)],
+    },
+    Def {
+        id: "proxmox",
+        name: "Proxmox VE",
+        description: "Nodes, VMs and containers on your Proxmox server.",
+        usage: "'nodes', 'vms', 'power <vmid> on|off|stop|reboot', 'raw <METHOD> </path>'",
+        logo: logo!("proxmox.svg"),
+        fields: &[field("url", "Proxmox URL", "https://proxmox.local:8006", false), field("token_id", "API token id", "user@pam!pixelcode", false), field("secret", "API token secret", "Datacenter > Permissions > API Tokens", true), field("insecure", "Allow self-signed certificate", "no / yes", false)],
+    },
+    Def {
+        id: "kubernetes",
+        name: "Kubernetes",
+        description: "Pods, deployments and logs in your clusters through kubectl.",
+        usage: "any kubectl arguments, e.g. 'get pods -A', 'logs deploy/web', 'rollout restart deploy/web'",
+        logo: logo!("kubernetes.svg"),
+        fields: &[field("context", "Context (optional)", "default: current kubectl context", false), field("kubeconfig", "Kubeconfig (optional)", "~/.kube/config", false)],
+    },
+    Def {
+        id: "stripe",
+        name: "Stripe",
+        description: "Payments, customers, products and subscriptions.",
+        usage: "'balance', 'payments', 'customers', 'products', 'subscriptions', 'raw <METHOD> </path>'",
+        logo: logo!("stripe.svg"),
+        fields: &[field("api_key", "API key", "a restricted key from dashboard.stripe.com/apikeys", true)],
+    },
+    Def {
+        id: "todoist",
+        name: "Todoist",
+        description: "Read, add and complete your Todoist tasks.",
+        usage: "'projects', 'tasks [project] [--filter today]', 'add <text> [--due ..]', 'done <id>'",
+        logo: logo!("todoist.svg"),
+        fields: &[field("token", "API token", "todoist.com > Settings > Integrations > Developer", true)],
+    },
+    Def {
+        id: "npm",
+        name: "npm",
+        description: "Look up and publish npm packages.",
+        usage: "'info <pkg>', 'search <words>', 'downloads <pkg>', or any npm arguments ('publish', 'version patch')",
+        logo: logo!("npm.svg"),
+        fields: &[field("token", "Access token (optional)", "npmjs.com > Access Tokens (for publish)", true)],
     },
 ];
+
+/// Kategorie eines Plugins (Filter und Gruppierung in den Einstellungen).
+pub fn category(id: &str) -> &'static str {
+    match id {
+        "github" | "gitlab" | "gitea" | "docker" | "database" | "sentry" | "ssh" | "playwright" | "kubernetes" | "npm" => "Development",
+        "vercel" | "netlify" | "cloudflare" | "aws" | "hetzner" | "digitalocean" | "fly" | "railway" | "render" | "heroku" | "linode" | "vultr" | "supabase" | "proxmox" => "Cloud",
+        "unity" | "unreal" | "godot" | "itch" | "steam" | "modrinth" | "curseforge" => "Game Dev",
+        "blender" | "leonardo" | "comfyui" | "elevenlabs" | "meshy" | "tripo" | "gimp" | "krita" | "resolve" => "Creative",
+        "telegram" | "discord" | "slack" | "whatsapp" | "email" | "ntfy" => "Messaging",
+        "notion" | "obsidian" | "linear" | "jira" | "trello" | "docs" | "todoist" | "stripe" => "Productivity",
+        "homeassistant" | "iobroker" => "Smart Home",
+        "websearch" | "ollama" => "AI & Search",
+        _ => "Other",
+    }
+}
+
+pub const CATEGORIES: &[&str] = &["Development", "Cloud", "Game Dev", "Creative", "Messaging", "Productivity", "Smart Home", "AI & Search"];
 
 const SCRIPTS: &[(&str, &str)] = &[
     ("common.mjs", include_str!("../assets/plugins/common.mjs")),
@@ -740,6 +813,13 @@ const SCRIPTS: &[(&str, &str)] = &[
     ("linode.mjs", include_str!("../assets/plugins/linode.mjs")),
     ("vultr.mjs", include_str!("../assets/plugins/vultr.mjs")),
     ("supabase.mjs", include_str!("../assets/plugins/supabase.mjs")),
+    ("iobroker.mjs", include_str!("../assets/plugins/iobroker.mjs")),
+    ("ollama.mjs", include_str!("../assets/plugins/ollama.mjs")),
+    ("proxmox.mjs", include_str!("../assets/plugins/proxmox.mjs")),
+    ("kubernetes.mjs", include_str!("../assets/plugins/kubernetes.mjs")),
+    ("stripe.mjs", include_str!("../assets/plugins/stripe.mjs")),
+    ("todoist.mjs", include_str!("../assets/plugins/todoist.mjs")),
+    ("npm.mjs", include_str!("../assets/plugins/npm.mjs")),
 ];
 
 fn scripts_dir() -> PathBuf {
@@ -854,7 +934,7 @@ pub fn setting(id: &str, key: &str) -> String {
 
 /// Gemeinsame Logik für OpenCode (JS) und omp (TS); läuft in beiden Fällen unter Bun.
 const CORE: &str = r#"
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -912,6 +992,33 @@ function pcSet(id, enabled) {
   return `${p.name} is now ${p.enabled ? "enabled" : "disabled"}.`;
 }
 
+// Meldet Pixel Code den Zustand des Agents in diesem Terminal (working, question, permission, done, error, idle).
+function pcStatus(state) {
+  const pane = process.env.PIXEL_CODE_PANE;
+  if (!pane) return;
+  const dir = process.env.PIXEL_CODE_STATUS_DIR || "/tmp/pixel-code-status";
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `.${pane}.${process.pid}`);
+    writeFileSync(tmp, state + "\n");
+    renameSync(tmp, join(dir, pane));
+  } catch {}
+}
+
+// OpenCode-Events -> Zustand
+function pcEvent(event) {
+  const t = event?.type || "", p = event?.properties || {};
+  if (t === "session.status") {
+    const s = p.status?.type;
+    if (s === "busy" || s === "retry") pcStatus("working");
+    else if (s === "idle") pcStatus("done");
+  } else if (t === "session.idle") pcStatus("done");
+  else if (t === "session.error") pcStatus("error");
+  else if (t === "permission.updated" || t === "permission.asked") pcStatus("permission");
+  else if (t === "question.asked") pcStatus("question");
+  else if (t === "permission.replied" || t === "question.replied" || t === "question.rejected") pcStatus("working");
+}
+
 const DESC = {
   list: "List the Pixel Code plugins (GitHub, Blender, Unity, Unreal Engine, Godot, web search, Leonardo.ai, Telegram, ...) with their status and usage. Call this before using pixelcode_plugin_run.",
   run: "Run a Pixel Code plugin command in the project directory, e.g. plugin 'github' with 'pr list', plugin 'websearch' with 'search rust egui', plugin 'blender' with 'exec <python>'. Run a plugin with 'help' to see all of its commands.",
@@ -927,6 +1034,8 @@ fn opencode_plugin() -> String {
 async function legacy() {{
   const {{ tool }} = await import("@opencode-ai/plugin");
   return {{
+    event: async ({{ event }}) => pcEvent(event),
+    "tool.execute.before": async (input) => {{ if (input?.tool === "question") pcStatus("question"); }},
     tool: {{
       pixelcode_plugins: tool({{ description: DESC.list, args: {{}}, async execute() {{ return pcList(); }} }}),
       pixelcode_plugin_run: tool({{
@@ -950,6 +1059,10 @@ async function legacy() {{
 // Die Parameter-Schemas werden aus OpenCodes eigenen Tools abgeleitet: Schemas aus einer anderen
 // `effect`-Version erkennt OpenCodes Validierung nicht ("Invalid arguments ... Expected object").
 async function setup(ctx) {{
+  // Zustand für die Pixel-Code-Sidebar
+  for (const sub of [ctx?.event?.subscribe, ctx?.bus?.subscribe]) {{
+    try {{ if (typeof sub === "function") {{ sub((e) => pcEvent(e?.payload ?? e)); break; }} }} catch {{}}
+  }}
   try {{
     const tools = await ctx.tool.list();
     const structs = tools.map((t) => t.input).filter((i) => i && typeof i.mapFields === "function" && i.fields);
@@ -1021,6 +1134,14 @@ fn omp_extension() -> String {
 const text = (t: string) => ({{ content: [{{ type: "text", text: t }}], details: {{}} }});
 
 export default function (pi: any): void {{
+  // Zustand für die Pixel-Code-Sidebar
+  const on = (ev: string, fn: (e: any) => void) => {{ try {{ pi.on?.(ev, fn); }} catch {{}} }};
+  on("agent_start", () => pcStatus("working"));
+  on("turn_start", () => pcStatus("working"));
+  on("agent_end", () => pcStatus("done"));
+  on("tool_call", (e: any) => pcStatus(/^(ask|question|ask_user)/.test(e?.toolName || e?.name || "") ? "question" : "working"));
+  on("tool_result", () => pcStatus("working"));
+  on("session_shutdown", () => pcStatus("idle"));
   pi.registerTool({{
     name: "pixelcode_plugins",
     label: "Pixel Code plugins",
@@ -1234,6 +1355,7 @@ fn install_kimi_plugin(home: &std::path::Path) {
 /// Registriert den Pixel-Code-MCP-Server bei einer CLI (über deren `mcp add` oder Konfigurationsdatei).
 fn install_mcp(agent: &str, bin: &str) {
     let Some(home) = dirs::home_dir() else { return };
+    install_status_hooks(agent, &home);
     let Some(node) = node() else { return };
     let script = mcp_path();
     write_if_changed(&script, &mcp_server());
@@ -1266,6 +1388,132 @@ fn install_mcp(agent: &str, bin: &str) {
             serde_json::json!({ "type": "local", "command": node_s, "args": [script_s], "tools": ["*"] }),
         ),
         "amp" => merge_json(&dirs::config_dir().unwrap_or(home.join(".config")).join("amp/settings.json"), "amp.mcpServers", stdio),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------- Agent-Status über Hooks
+
+/// Ordner, in den Hooks und Plugins den Zustand je Terminal schreiben (Datei `<pane id>`).
+pub fn status_dir() -> PathBuf {
+    dirs::runtime_dir().or_else(dirs::cache_dir).unwrap_or_else(|| PathBuf::from("/tmp")).join("pixel-code/status")
+}
+
+fn hook_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pixel-code/bin/pixel-code-hook")
+}
+
+/// Wird von den Hooks der CLIs aufgerufen: `pixel-code-hook <state>`, Hook-JSON auf stdin.
+const HOOK: &str = r#"#!/bin/sh
+# @pixel-code-managed - reports the agent state of a Pixel Code terminal.
+input=$(cat 2>/dev/null)
+[ -n "$PIXEL_CODE_PANE" ] || exit 0
+state="$1"
+case "$state" in
+  tool)
+    case "$input" in
+      *'"tool_name":"AskUserQuestion"'*|*'"tool_name": "AskUserQuestion"'*|*'"request_user_input"'*|*'"ask_user"'*) state=question ;;
+      *) state=working ;;
+    esac ;;
+  notify)
+    case "$input" in
+      *permission_prompt*|*ToolPermission*|*"needs your permission"*) state=permission ;;
+      *elicitation*) state=question ;;
+      *) exit 0 ;;
+    esac ;;
+esac
+dir="${PIXEL_CODE_STATUS_DIR:-/tmp/pixel-code-status}"
+mkdir -p "$dir" 2>/dev/null
+printf '%s\n' "$state" > "$dir/.$PIXEL_CODE_PANE.$$" && mv -f "$dir/.$PIXEL_CODE_PANE.$$" "$dir/$PIXEL_CODE_PANE"
+exit 0
+"#;
+
+fn install_hook_script() -> String {
+    let path = hook_path();
+    if write_if_changed(&path, HOOK) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    let p = path.display().to_string().replace('\'', "'\\''");
+    p
+}
+
+/// Trägt die Status-Hooks in eine Hook-Konfiguration ein. `nested`: Claude/Codex-Format
+/// (`[{ hooks: [..] }]`), sonst das flache Format von Gemini/Antigravity.
+fn merge_hooks(path: &std::path::Path, events: &[(&str, &str)], nested: bool) {
+    let script = install_hook_script();
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        _ => serde_json::json!({}),
+    };
+    let before = root.clone();
+    let Some(obj) = root.as_object_mut() else { return };
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let Some(hooks) = hooks.as_object_mut() else { return };
+    let ours = |v: &serde_json::Value| v.to_string().contains("pixel-code-hook");
+    for (event, state) in events {
+        let command = format!("test -x '{script}' && '{script}' {state} || cat >/dev/null");
+        let entry = if nested {
+            serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] })
+        } else {
+            serde_json::json!({ "type": "command", "command": command, "timeout": 10000 })
+        };
+        let list = hooks.entry(*event).or_insert_with(|| serde_json::json!([]));
+        let Some(list) = list.as_array_mut() else { continue };
+        if list.iter().any(|v| *v == entry) {
+            continue;
+        }
+        list.retain(|v| !ours(v));
+        list.push(entry);
+    }
+    if root == before {
+        return;
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+fn install_status_hooks(agent: &str, home: &std::path::Path) {
+    const CLAUDE: &[(&str, &str)] = &[
+        ("SessionStart", "idle"),
+        ("UserPromptSubmit", "working"),
+        ("PreToolUse", "tool"),
+        ("PostToolUse", "working"),
+        ("PermissionRequest", "permission"),
+        ("Notification", "notify"),
+        ("Stop", "done"),
+        ("StopFailure", "error"),
+        ("SessionEnd", "idle"),
+    ];
+    const CODEX: &[(&str, &str)] = &[
+        ("SessionStart", "idle"),
+        ("UserPromptSubmit", "working"),
+        ("PreToolUse", "tool"),
+        ("PostToolUse", "working"),
+        ("PermissionRequest", "permission"),
+        ("Stop", "done"),
+    ];
+    const GEMINI: &[(&str, &str)] = &[
+        ("SessionStart", "idle"),
+        ("BeforeAgent", "working"),
+        ("BeforeTool", "tool"),
+        ("AfterTool", "working"),
+        ("Notification", "notify"),
+        ("AfterAgent", "done"),
+        ("SessionEnd", "idle"),
+    ];
+    match agent {
+        "claude" => merge_hooks(&home.join(".claude/settings.json"), CLAUDE, true),
+        "codex" => merge_hooks(&home.join(".codex/hooks.json"), CODEX, true),
+        "gemini" => merge_hooks(&home.join(".gemini/settings.json"), GEMINI, false),
+        "qwen" => merge_hooks(&home.join(".qwen/settings.json"), GEMINI, false),
         _ => {}
     }
 }

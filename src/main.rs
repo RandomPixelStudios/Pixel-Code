@@ -1,11 +1,13 @@
 mod agents;
 mod icons;
+mod keybinds;
 mod layout;
 mod plugins;
 mod settings;
 mod telegram;
 mod terminal;
 mod theme;
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,7 +17,8 @@ use std::time::{Duration, Instant};
 use agents::{Agent, AGENTS};
 use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense, Stroke};
 use icons::Icon;
-use layout::{Grid, PaneId};
+use keybinds::{Cmd, Keybinds};
+use layout::{Grid, PaneId, Side};
 use serde::{Deserialize, Serialize};
 use terminal::{Status, Terminal};
 use theme::*;
@@ -139,8 +142,16 @@ fn shell_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------- UI-Zustand
 
+/// Wird beim Ziehen eines Terminals (Kopfzeile oder Sidebar) mitgeführt.
+#[derive(Clone, Copy)]
+struct PaneDrag(PaneId);
+
 enum Action {
     Focus(PaneId),
+    /// Pane neben eine andere Pane verschieben (auch aus einer anderen Session desselben Projekts)
+    Move(PaneId, PaneId, Side),
+    /// In eine andere Session des aktuellen Projekts (None = neue Session)
+    MoveToSession(PaneId, Option<usize>),
     SplitRight(PaneId),
     SplitDown(PaneId),
     Close(PaneId),
@@ -220,6 +231,16 @@ struct App {
     tg_enter: Vec<(PaneId, Instant)>,
     tg_status: HashMap<PaneId, Status>,
     tg_checked: Option<Instant>,
+    keybinds: Keybinds,
+    updater: update::Updater,
+    /// Vom Plugin/Hook gemeldeter Zustand je Terminal, seit wann
+    hook: HashMap<PaneId, (Status, Instant)>,
+    /// Geschätzter Zustand (Terminals ohne Hook) und seit wann ein Agent fertig ist
+    heur: HashMap<PaneId, Status>,
+    heur_done: HashMap<PaneId, Instant>,
+    /// Wann der Nutzer ein Terminal zuletzt angesehen hat
+    seen: HashMap<PaneId, Instant>,
+    status_at: Option<Instant>,
 }
 
 impl App {
@@ -259,7 +280,17 @@ impl App {
             tg_enter: Vec::new(),
             tg_status: HashMap::new(),
             tg_checked: None,
+            keybinds: Keybinds::load(),
+            updater: update::Updater::new(),
+            hook: HashMap::new(),
+            heur: HashMap::new(),
+            heur_done: HashMap::new(),
+            seen: HashMap::new(),
+            status_at: None,
         };
+        // Alte Zustände vom letzten Start verwerfen
+        let _ = std::fs::remove_dir_all(plugins::status_dir());
+        app.updater.check(ctx.clone());
         app.select(app.store.project, app.store.session);
         // Plugin-Registry (GitHub-Status) für die Agents aktuell halten
         let _ = plugins::GitHub::new(ctx.clone());
@@ -375,6 +406,7 @@ impl App {
 
     fn close_pane(&mut self, id: PaneId) {
         self.terms.remove(&id);
+        let _ = std::fs::remove_file(plugins::status_dir().join(id.to_string()));
         self.pending.remove(&id);
         for p in &mut self.store.projects {
             for s in &mut p.sessions {
@@ -431,6 +463,18 @@ impl App {
                 }
             }
             Action::Close(id) => self.close_pane(id),
+            Action::Move(id, target, side) => self.move_pane(id, Some((target, side)), None),
+            Action::MoveToSession(id, s) => {
+                let s = match s {
+                    Some(s) => s,
+                    None => {
+                        let p = &mut self.store.projects[self.store.project];
+                        p.sessions.push(Session::new(format!("Session {}", p.sessions.len() + 1)));
+                        p.sessions.len() - 1
+                    }
+                };
+                self.move_pane(id, None, Some(s));
+            }
             Action::New => self.launch(Launch::Agent(&AGENTS[0])),
             Action::ToggleMax(id) => {
                 self.maximized = if self.maximized == Some(id) { None } else { Some(id) };
@@ -443,50 +487,156 @@ impl App {
         }
     }
 
+    /// Verschiebt eine Pane innerhalb des aktuellen Projekts: neben `at` (in dessen Session)
+    /// oder ans Ende von Session `session`. Das Terminal läuft dabei einfach weiter.
+    fn move_pane(&mut self, id: PaneId, at: Option<(PaneId, Side)>, session: Option<usize>) {
+        let pi = self.store.project;
+        let Some(p) = self.store.projects.get_mut(pi) else { return };
+        let Some(src) = p.sessions.iter().position(|s| s.grid.contains(id)) else { return };
+        let dst = match (at, session) {
+            (Some((t, _)), _) => p.sessions.iter().position(|s| s.grid.contains(t)),
+            (None, Some(s)) => Some(s),
+            _ => None,
+        };
+        let Some(dst) = dst.filter(|d| *d < p.sessions.len()) else { return };
+        if src == dst {
+            if let Some((t, side)) = at {
+                if p.sessions[src].grid.move_pane(id, t, side) {
+                    self.focused = Some(id);
+                    self.maximized = None;
+                    self.save();
+                }
+            }
+            return;
+        }
+        let ok = match at {
+            Some((t, side)) => p.sessions[dst].grid.place(id, t, side),
+            None => p.sessions[dst].grid.push(id),
+        };
+        if !ok {
+            return;
+        }
+        p.sessions[src].grid.remove(id);
+        if let Some(n) = p.sessions[src].names.remove(&id) {
+            p.sessions[dst].names.insert(id, n);
+        }
+        if let Some(a) = p.sessions[src].agents.remove(&id) {
+            p.sessions[dst].agents.insert(id, a);
+        }
+        p.expanded = true;
+        self.select(pi, dst);
+        self.focused = Some(id);
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let cs = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
-        let c = egui::Modifiers::CTRL;
-        let multi = self.session().is_some_and(|s| s.grid.len() > 1);
-        let (d, e, w, t, m, next, prev) = ctx.input_mut(|i| {
-            (
-                i.consume_key(cs, egui::Key::D),
-                i.consume_key(cs, egui::Key::E),
-                i.consume_key(c, egui::Key::W) || i.consume_key(cs, egui::Key::W),
-                i.consume_key(c, egui::Key::T) || i.consume_key(cs, egui::Key::T),
-                i.consume_key(cs, egui::Key::Enter),
-                i.consume_key(c, egui::Key::Tab) || (multi && i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)),
-                i.consume_key(cs, egui::Key::Tab),
-            )
-        });
-        if next || prev {
+        for cmd in self.keybinds.consume(ctx) {
             let panes = self.session().map(|s| s.grid.panes()).unwrap_or_default();
-            if !panes.is_empty() {
-                let cur = self.focused.and_then(|f| panes.iter().position(|p| *p == f)).unwrap_or(0);
-                let n = panes.len();
-                let i = if next { (cur + 1) % n } else { (cur + n - 1) % n };
-                self.focused = Some(panes[i]);
-                if self.maximized.is_some() {
-                    self.maximized = Some(panes[i]);
+            match cmd {
+                Cmd::NextPane | Cmd::PrevPane if !panes.is_empty() => {
+                    let cur = self.focused.and_then(|f| panes.iter().position(|p| *p == f)).unwrap_or(0);
+                    let n = panes.len();
+                    let i = if cmd == Cmd::NextPane { (cur + 1) % n } else { (cur + n - 1) % n };
+                    self.focused = Some(panes[i]);
+                    if self.maximized.is_some() {
+                        self.maximized = Some(panes[i]);
+                    }
+                }
+                Cmd::NewTerminal => self.launch(Launch::Agent(&AGENTS[0])),
+                Cmd::NewSession if self.project().is_some() => self.new_session(self.store.project),
+                Cmd::NextSession | Cmd::PrevSession => {
+                    let n = self.project().map_or(0, |p| p.sessions.len());
+                    if n > 0 {
+                        let cur = self.store.session;
+                        let s = if cmd == Cmd::NextSession { (cur + 1) % n } else { (cur + n - 1) % n };
+                        self.select(self.store.project, s);
+                    }
+                }
+                Cmd::AddProject => self.modal = Some(Modal::Add(AddDialog::new())),
+                Cmd::Settings => self.open_settings(ctx, settings::Page::Plugins),
+                _ => {
+                    let Some(f) = self.focused else { continue };
+                    match cmd {
+                        Cmd::SplitRight => self.apply(Action::SplitRight(f)),
+                        Cmd::SplitDown => self.apply(Action::SplitDown(f)),
+                        Cmd::Close => self.apply(Action::Close(f)),
+                        Cmd::Maximize => self.apply(Action::ToggleMax(f)),
+                        _ => {}
+                    }
                 }
             }
         }
-        if t {
-            self.launch(Launch::Agent(&AGENTS[0]));
+    }
+
+    fn open_settings(&mut self, ctx: &egui::Context, page: settings::Page) {
+        self.settings = Some(settings::Settings::new(ctx, page, self.keybinds.clone(), self.updater.clone()));
+    }
+
+    // ---------------------------------------------------------------- Agent-Status
+
+    /// Liest die Zustände der Hooks/Plugins und schätzt sie für alle anderen Terminals.
+    fn poll_status(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        // Angesehen: fokussiertes Terminal der sichtbaren Session, solange das Fenster aktiv ist
+        if let Some(f) = self.focused.filter(|f| self.session().is_some_and(|s| s.grid.contains(*f))) {
+            if ctx.input(|i| i.viewport().focused.unwrap_or(true)) && self.settings.is_none() {
+                self.seen.insert(f, now);
+            }
         }
-        if let Some(f) = self.focused {
-            if d {
-                self.apply(Action::SplitRight(f));
+        if self.status_at.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            return;
+        }
+        self.status_at = Some(now);
+        let dir = plugins::status_dir();
+        for (&id, t) in &self.terms {
+            let file = dir.join(id.to_string());
+            if t.foreground() == t.shell_name {
+                // Agent beendet: gemeldeter Zustand gilt nicht mehr
+                if self.hook.remove(&id).is_some() {
+                    let _ = std::fs::remove_file(&file);
+                }
+            } else {
+                match std::fs::read_to_string(&file).ok().and_then(|s| Status::parse(&s)) {
+                    Some(st) => {
+                        if self.hook.get(&id).is_none_or(|(old, _)| *old != st) {
+                            self.hook.insert(id, (st, now));
+                        }
+                    }
+                    None => {
+                        self.hook.remove(&id);
+                    }
+                }
             }
-            if e {
-                self.apply(Action::SplitDown(f));
-            }
-            if w {
-                self.apply(Action::Close(f));
-            }
-            if m {
-                self.apply(Action::ToggleMax(f));
+            let h = t.status();
+            let prev = self.heur.insert(id, h);
+            if prev == Some(Status::Working) && h == Status::Idle {
+                self.heur_done.insert(id, now);
+            } else if h != Status::Idle {
+                self.heur_done.remove(&id);
             }
         }
+        let terms = &self.terms;
+        self.hook.retain(|id, _| terms.contains_key(id));
+        self.heur.retain(|id, _| terms.contains_key(id));
+        self.heur_done.retain(|id, _| terms.contains_key(id));
+        self.seen.retain(|id, _| terms.contains_key(id));
+    }
+
+    fn seen_since(&self, id: PaneId, since: Instant) -> bool {
+        self.seen.get(&id).is_some_and(|t| *t >= since) || self.terms.get(&id).is_some_and(|t| t.last_input() >= since)
+    }
+
+    fn status(&self, id: PaneId) -> Status {
+        if !self.terms.get(&id).is_some_and(|t| t.is_alive()) {
+            return Status::Idle;
+        }
+        if let Some(&(st, since)) = self.hook.get(&id) {
+            return if st == Status::Done && self.seen_since(id, since) { Status::Idle } else { st };
+        }
+        let h = self.heur.get(&id).copied().unwrap_or(Status::Idle);
+        if h == Status::Idle && self.heur_done.get(&id).is_some_and(|since| !self.seen_since(id, *since)) {
+            return Status::Done;
+        }
+        h
     }
 
     // ---------------------------------------------------------------- Telegram
@@ -497,10 +647,12 @@ impl App {
         if let Some(n) = session.and_then(|s| s.names.get(&id)) {
             return n.clone();
         }
-        let fg = self.terms.get(&id).map(|t| t.foreground()).unwrap_or_default();
-        agents::by_process(&fg)
-            .or_else(|| session.and_then(|s| s.agents.get(&id)).and_then(|a| agents::get(a)))
-            .map_or(fg, |a| a.name.to_string())
+        let agent = session.map(|s| self.pane_agent(s, id)).filter(|a| a.bin.is_some());
+        match (agent, self.terms.get(&id)) {
+            (Some(a), _) => a.name.to_string(),
+            (None, Some(t)) => t.foreground(),
+            (None, None) => "Terminal".into(),
+        }
     }
 
     fn tg_target(&self) -> Option<PaneId> {
@@ -590,15 +742,16 @@ impl App {
         let active = telegram::active();
         let ids: Vec<PaneId> = self.terms.keys().copied().collect();
         for id in ids {
-            let status = self.terms[&id].status();
+            let status = self.status(id);
             let prev = self.tg_status.insert(id, status);
             if !active || prev == Some(status) || prev.is_none() {
                 continue;
             }
             let name = self.pane_label(id);
             match status {
-                Status::Idle if prev == Some(Status::Working) => telegram::send(format!("✅ {name} is done.\n\n{}", self.terms[&id].screen_text(15))),
-                Status::Question => telegram::send(format!("❓ {name} needs your input:\n\n{}", self.terms[&id].screen_text(20))),
+                Status::Idle | Status::Done if prev == Some(Status::Working) => telegram::send(format!("✅ {name} is done.\n\n{}", self.terms[&id].screen_text(15))),
+                Status::Question => telegram::send(format!("❓ {name} has a question:\n\n{}", self.terms[&id].screen_text(20))),
+                Status::Permission => telegram::send(format!("🔐 {name} needs your permission:\n\n{}", self.terms[&id].screen_text(20))),
                 Status::Error => telegram::send(format!("❌ {name} reported an error:\n\n{}", self.terms[&id].screen_text(15))),
                 _ => {}
             }
@@ -608,204 +761,279 @@ impl App {
 
     // ---------------------------------------------------------------- Sidebar
 
+    /// Agent, der in einer Pane läuft (laufendes Programm vor dem Start-Agent).
+    fn pane_agent(&self, s: &Session, id: PaneId) -> &'static Agent {
+        let stored = s.agents.get(&id).and_then(|a| agents::get(a));
+        match self.terms.get(&id) {
+            Some(t) => {
+                let fg = t.foreground();
+                agents::by_process(&fg).or(if fg == t.shell_name { None } else { stored })
+            }
+            None => stored,
+        }
+        .unwrap_or(&AGENTS[0])
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let card = ui.max_rect();
-        ui.painter().rect(card, RADIUS, Color32::BLACK, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-        let inner = card.shrink(10.0);
+        ui.painter().rect(card, RADIUS, PANE, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
 
-        // Footer mit Settings
-        let footer = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 34.0), inner.max);
-        ui.painter().line_segment(
-            [pos2(card.left() + 1.0, footer.top() - 9.0), pos2(card.right() - 1.0, footer.top() - 9.0)],
-            Stroke::new(1.0, BORDER),
-        );
-        let resp = ui.interact(footer, ui.id().with("settings"), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(footer, 8.0, HOVER);
+        // Kopfzeile wie bei den Terminals: Name links, Aktionen rechts
+        let head = Rect::from_min_size(card.min, vec2(card.width(), HEAD));
+        ui.painter().line_segment([head.left_bottom() + vec2(1.0, 0.0), head.right_bottom() - vec2(1.0, 0.0)], Stroke::new(1.0, BORDER));
+        let mark = Rect::from_center_size(head.left_center() + vec2(22.0, 0.0), vec2(14.0, 14.0));
+        for (i, a) in [1.0, 0.55, 0.55, 0.25].iter().enumerate() {
+            let cell = Rect::from_min_size(mark.min + vec2((i % 2) as f32 * 7.5, (i / 2) as f32 * 7.5), vec2(6.5, 6.5));
+            ui.painter().rect_filled(cell, 1.5, ACCENT.gamma_multiply(*a));
         }
-        let col = if resp.hovered() { TEXT } else { MUTED };
-        icons::draw(ui.painter(), footer.left_center() + vec2(16.0, 0.0), Icon::Gear, col);
-        ui.painter().text(footer.left_center() + vec2(34.0, 0.0), egui::Align2::LEFT_CENTER, "Settings", medium(13.0), col);
-        if resp.clicked() {
-            self.settings = Some(settings::Settings::new(ui.ctx()));
+        ui.painter().text(head.left_center() + vec2(38.0, 0.0), egui::Align2::LEFT_CENTER, "Pixel Code", semibold(13.0), TEXT);
+
+        let update = self.updater.available().is_some();
+        let mut x = head.right() - 20.0;
+        let mut btn = |ui: &mut egui::Ui, icon: Icon, tip: String, dot: bool| {
+            let r = Rect::from_center_size(pos2(x, head.center().y), vec2(26.0, 26.0));
+            x -= 28.0;
+            let resp = ui.interact(r, ui.id().with(("sidebar_btn", tip.clone())), Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(r, 6.0, HOVER);
+            }
+            icons::draw(ui.painter(), r.center(), icon, if resp.hovered() { TEXT } else { MUTED });
+            if dot {
+                ui.painter().circle(r.right_top() + vec2(-6.0, 6.0), 3.5, GREEN, Stroke::new(1.5, PANE));
+            }
+            resp.on_hover_text(tip).clicked()
+        };
+        let settings_tip = if update { "Settings · update available".to_string() } else { self.keybinds.tip("Settings", Cmd::Settings) };
+        if btn(ui, Icon::Gear, settings_tip, update) {
+            let page = if update { settings::Page::Update } else { settings::Page::Plugins };
+            self.open_settings(ui.ctx(), page);
+        }
+        if btn(ui, Icon::Plus, self.keybinds.tip("Add project", Cmd::AddProject), false) {
+            self.modal = Some(Modal::Add(AddDialog::new()));
         }
 
-        let list = Rect::from_min_max(pos2(inner.left(), inner.top() + 4.0), pos2(inner.right(), footer.top() - 18.0));
+        let list = Rect::from_min_max(pos2(card.left() + 8.0, head.bottom() + 10.0), card.max - vec2(8.0, 8.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| self.project_list(ui));
     }
 
     fn project_list(&mut self, ui: &mut egui::Ui) {
-        let (btn, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
-        ui.painter().rect(
-            btn,
-            10.0,
-            if resp.hovered() { SELECTED } else { ELEVATED },
-            Stroke::new(1.0, if resp.hovered() { BORDER_STRONG.gamma_multiply(1.6) } else { BORDER_STRONG }),
-            egui::StrokeKind::Inside,
-        );
-        let label = ui.painter().layout_no_wrap("Add project".into(), medium(13.5), TEXT);
-        let w = 12.0 + 8.0 + label.size().x;
-        let x0 = btn.center().x - w / 2.0;
-        icons::draw(ui.painter(), pos2(x0 + 6.0, btn.center().y), Icon::Plus, TEXT);
-        ui.painter().galley(pos2(x0 + 20.0, btn.center().y - label.size().y / 2.0), label, TEXT);
-        if resp.clicked() {
-            self.modal = Some(Modal::Add(AddDialog::new()));
-        }
-        ui.add_space(14.0);
-        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-        ui.painter().text(head.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, "PROJECTS", semibold(10.5), FAINT);
-        ui.add_space(4.0);
-
-        enum Cmd {
+        enum SideCmd {
             Select(usize, usize),
+            Focus(usize, usize, PaneId),
             Toggle(usize),
             NewSession(usize),
             CloseSession(usize, usize),
             Rename(Rename, String),
             Remove(usize),
+            Move(PaneId, usize),
         }
         let mut cmds = Vec::new();
 
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        ui.painter().text(head.left_center() + vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, "PROJECTS", semibold(10.5), FAINT);
+        ui.add_space(4.0);
+
         if self.store.projects.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("No projects yet").color(MUTED));
+            ui.label(RichText::new("  No projects yet").color(MUTED));
         }
 
+        let ctx = ui.ctx().clone();
+        let dragging = egui::DragAndDrop::payload::<PaneDrag>(&ctx).map(|d| d.0);
         let now = ui.input(|i| i.time);
         let mut animate = false;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for (pi, p) in self.store.projects.iter().enumerate() {
                 let active_p = pi == self.store.project;
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
                 let plus_r = Rect::from_center_size(rect.right_center() - vec2(14.0, 0.0), vec2(22.0, 22.0));
                 let dots_r = plus_r.translate(vec2(-24.0, 0.0));
                 let plus = ui.interact(plus_r, ui.id().with(("newsession", pi)), Sense::click());
                 let dots = ui.interact(dots_r, ui.id().with(("dots", pi)), Sense::click());
                 let hovered = resp.hovered() || plus.hovered() || dots.hovered();
                 let menu_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&dots));
-
                 if hovered || menu_open {
                     ui.painter().rect_filled(rect, 8.0, HOVER);
                 }
-                let ir = Rect::from_center_size(rect.left_center() + vec2(15.0, 0.0), vec2(16.0, 16.0));
+
+                // Pfeil auf/zu, Ordner- bzw. Server-Icon, Name
+                let chev = rect.left_center() + vec2(12.0, 0.0);
+                let col = if hovered { MUTED } else { FAINT };
+                let st = Stroke::new(1.3, col);
+                if p.expanded {
+                    ui.painter().line_segment([chev + vec2(-3.5, -1.5), chev + vec2(0.0, 2.0)], st);
+                    ui.painter().line_segment([chev + vec2(0.0, 2.0), chev + vec2(3.5, -1.5)], st);
+                } else {
+                    ui.painter().line_segment([chev + vec2(-1.5, -3.5), chev + vec2(2.0, 0.0)], st);
+                    ui.painter().line_segment([chev + vec2(2.0, 0.0), chev + vec2(-1.5, 3.5)], st);
+                }
+                let ir = Rect::from_center_size(rect.left_center() + vec2(32.0, 0.0), vec2(15.0, 15.0));
                 if p.location.is_remote() {
-                    draw_small(ui.painter(), ir.center(), Icon::Server, if active_p { MUTED } else { FAINT });
+                    icons::draw(ui.painter(), ir.center(), Icon::Server, if active_p { MUTED } else { FAINT });
                 } else {
                     egui::Image::from_bytes("bytes://folder.svg", FOLDER_SVG)
-                        .tint(if active_p { TEXT } else { Color32::from_white_alpha(170) })
+                        .tint(if active_p { TEXT } else { Color32::from_white_alpha(150) })
                         .paint_at(ui, ir);
                 }
                 let name_clip = Rect::from_min_max(rect.min, pos2(dots_r.left() - 4.0, rect.bottom()));
                 ui.painter().with_clip_rect(name_clip).text(
-                    rect.left_center() + vec2(32.0, 0.0),
+                    rect.left_center() + vec2(48.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     &p.name,
-                    medium(13.5),
+                    semibold(13.0),
                     if active_p { TEXT } else { MUTED },
                 );
-
+                // Eingeklappt: wichtigster Zustand des Projekts als Punkt
+                if !p.expanded && !hovered {
+                    let st = p.sessions.iter().flat_map(|s| s.grid.panes()).map(|id| self.status(id)).max_by_key(|s| urgency(*s));
+                    if let Some(st) = st.filter(|s| *s != Status::Idle) {
+                        ui.painter().circle_filled(rect.right_center() - vec2(14.0, 0.0), 3.5, status_color(st));
+                    }
+                }
                 for (r, resp, icon) in [(plus_r, &plus, Icon::Plus), (dots_r, &dots, Icon::Dots)] {
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 6.0, SELECTED);
                     }
-                    let visible = matches!(icon, Icon::Plus) || hovered || menu_open;
-                    if visible {
-                        let col = if resp.hovered() { TEXT } else if hovered { MUTED } else { FAINT };
-                        icons::draw(ui.painter(), r.center(), icon, col);
+                    if hovered || menu_open {
+                        icons::draw(ui.painter(), r.center(), icon, if resp.hovered() { TEXT } else { MUTED });
                     }
                 }
-                let plus = plus.on_hover_text("New session");
-                if plus.clicked() {
-                    cmds.push(Cmd::NewSession(pi));
+                if plus.on_hover_text("New session").clicked() {
+                    cmds.push(SideCmd::NewSession(pi));
                 } else if resp.clicked() {
-                    cmds.push(Cmd::Toggle(pi));
+                    cmds.push(SideCmd::Toggle(pi));
                 }
-
                 let mut menu = |ui: &mut egui::Ui| {
                     ui.set_min_width(170.0);
                     if menu_item(ui, "New session") {
-                        cmds.push(Cmd::NewSession(pi));
+                        cmds.push(SideCmd::NewSession(pi));
                     }
                     if menu_item(ui, "Rename…") {
-                        cmds.push(Cmd::Rename(Rename::Project(pi), p.name.clone()));
+                        cmds.push(SideCmd::Rename(Rename::Project(pi), p.name.clone()));
                     }
                     ui.separator();
                     if menu_item_danger(ui, "Remove project") {
-                        cmds.push(Cmd::Remove(pi));
+                        cmds.push(SideCmd::Remove(pi));
                     }
                 };
                 egui::Popup::menu(&dots).show(&mut menu);
                 resp.context_menu(&mut menu);
                 resp.on_hover_text(p.location.display());
 
-                if p.expanded {
-                    for (si, s) in p.sessions.iter().enumerate() {
-                        let panes = s.grid.panes();
-                        let h = if panes.is_empty() { 30.0 } else { 54.0 };
-                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
-                        let r = Rect::from_min_max(r.min + vec2(14.0, 0.0), r.max);
-                        let active = active_p && si == self.store.session;
-                        let fill = if active { SELECTED } else if resp.hovered() { HOVER } else { Color32::TRANSPARENT };
-                        ui.painter().rect_filled(r, 8.0, fill);
-                        if active {
-                            let bar = Rect::from_min_max(pos2(r.left(), r.top() + 8.0), pos2(r.left() + 2.5, r.bottom() - 8.0));
-                            ui.painter().rect_filled(bar, 2.0, ACCENT);
+                if !p.expanded {
+                    ui.add_space(4.0);
+                    continue;
+                }
+                if p.sessions.is_empty() {
+                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+                    ui.painter().text(r.left_center() + vec2(48.0, 0.0), egui::Align2::LEFT_CENTER, "No sessions", font(12.0), FAINT);
+                }
+                // Gezogene Pane gehört zu diesem Projekt? Dann sind die Sessions Ablageziele.
+                let drag_here = dragging.filter(|d| p.sessions.iter().any(|s| s.grid.contains(*d)));
+                for (si, s) in p.sessions.iter().enumerate() {
+                    let panes = s.grid.panes();
+                    let active = active_p && si == self.store.session;
+                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                    let r = Rect::from_min_max(r.min + vec2(18.0, 0.0), r.max);
+                    let drop = drag_here.filter(|d| !s.grid.contains(*d) && !s.grid.is_full());
+                    let drop_hover = drop.is_some() && ui.rect_contains_pointer(r);
+                    let fill = if drop_hover { ACCENT.gamma_multiply(0.12) } else if active { SELECTED } else if resp.hovered() { HOVER } else { Color32::TRANSPARENT };
+                    ui.painter().rect_filled(r, 8.0, fill);
+                    if drop.is_some() {
+                        let stroke = if drop_hover { Stroke::new(1.0, ACCENT.gamma_multiply(0.8)) } else { Stroke::new(1.0, BORDER_STRONG) };
+                        ui.painter().rect_stroke(r, 8.0, stroke, egui::StrokeKind::Inside);
+                    }
+                    if active {
+                        let bar = Rect::from_min_max(pos2(r.left(), r.top() + 8.0), pos2(r.left() + 2.5, r.bottom() - 8.0));
+                        ui.painter().rect_filled(bar, 2.0, ACCENT);
+                    }
+                    // Wichtigster Zustand der Session
+                    let st = panes.iter().map(|id| self.status(*id)).max_by_key(|s| urgency(*s)).unwrap_or(Status::Idle);
+                    let dot = r.left_center() + vec2(14.0, 0.0);
+                    let alive = panes.iter().any(|id| self.terms.get(id).is_some_and(|t| t.is_alive()));
+                    if st == Status::Idle {
+                        ui.painter().circle_filled(dot, 3.0, if alive { MUTED } else { FAINT });
+                    } else {
+                        ui.painter().circle_filled(dot, 3.5, status_color(st));
+                    }
+                    let clip = Rect::from_min_max(r.min, pos2(r.right() - 34.0, r.bottom()));
+                    ui.painter().with_clip_rect(clip).text(
+                        r.left_center() + vec2(28.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        &s.name,
+                        medium(13.0),
+                        if active { TEXT } else { MUTED },
+                    );
+                    if drop_hover {
+                        ui.painter().text(r.right_center() - vec2(12.0, 0.0), egui::Align2::RIGHT_CENTER, "Move here", medium(11.5), ACCENT);
+                    } else if !panes.is_empty() {
+                        let badge = Rect::from_center_size(r.right_center() - vec2(18.0, 0.0), vec2(22.0, 18.0));
+                        ui.painter().rect_filled(badge, 6.0, if active { BORDER_STRONG } else { ELEVATED });
+                        ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, panes.len().to_string(), medium(10.5), MUTED);
+                    }
+                    if let Some(d) = drop {
+                        if resp.dnd_release_payload::<PaneDrag>().is_some() || (drop_hover && ui.input(|i| i.pointer.any_released())) {
+                            cmds.push(SideCmd::Move(d, si));
                         }
-                        let line = r.top() + 15.0;
-                        let alive = panes.iter().any(|id| self.terms.get(id).is_some_and(|t| t.is_alive()));
-                        ui.painter().circle_filled(pos2(r.left() + 14.0, line), 3.0, if alive { GREEN } else { FAINT });
-                        ui.painter().with_clip_rect(Rect::from_min_max(r.min, pos2(r.right() - 30.0, r.bottom()))).text(
-                            pos2(r.left() + 26.0, line),
+                    }
+                    if resp.clicked() {
+                        cmds.push(SideCmd::Select(pi, si));
+                    }
+                    resp.context_menu(|ui| {
+                        ui.set_min_width(160.0);
+                        if menu_item(ui, "Rename…") {
+                            cmds.push(SideCmd::Rename(Rename::Session(pi, si), s.name.clone()));
+                        }
+                        ui.separator();
+                        if menu_item_danger(ui, "Close session") {
+                            cmds.push(SideCmd::CloseSession(pi, si));
+                        }
+                    });
+
+                    // Ein Eintrag pro Terminal: Logo mit Status-Ring, Name, Zustand
+                    for id in &panes {
+                        let (row, tresp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click_and_drag());
+                        let row = Rect::from_min_max(row.min + vec2(34.0, 0.0), row.max);
+                        let focused = active && self.focused == Some(*id);
+                        let being_dragged = dragging == Some(*id);
+                        if being_dragged {
+                            ui.painter().rect_stroke(row, 7.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                        } else if focused {
+                            ui.painter().rect_filled(row, 7.0, HOVER);
+                        } else if tresp.hovered() {
+                            ui.painter().rect_filled(row, 7.0, HOVER);
+                        }
+                        let st = self.status(*id);
+                        let c = row.left_center() + vec2(14.0, 0.0);
+                        if st != Status::Idle {
+                            status_ring(ui.painter(), c, st, now, 9.5);
+                            animate |= matches!(st, Status::Working | Status::Question | Status::Permission);
+                        }
+                        self.pane_agent(s, *id).paint_logo(ui, Rect::from_center_size(c, vec2(13.0, 13.0)), false);
+                        let label = self.pane_label(*id);
+                        let pill = status_pill(ui, st, row);
+                        let clip = Rect::from_min_max(row.min, pos2(pill.map_or(row.right() - 8.0, |p| p.left() - 6.0), row.bottom()));
+                        ui.painter().with_clip_rect(clip).text(
+                            row.left_center() + vec2(28.0, 0.0),
                             egui::Align2::LEFT_CENTER,
-                            &s.name,
-                            medium(13.0),
-                            if active { TEXT } else { MUTED },
+                            &label,
+                            font(12.5),
+                            if focused || tresp.hovered() { TEXT } else { MUTED },
                         );
-                        if !panes.is_empty() {
-                            let badge = Rect::from_center_size(pos2(r.right() - 16.0, line), vec2(20.0, 17.0));
-                            ui.painter().rect_filled(badge, 6.0, if active { BORDER_STRONG } else { ELEVATED });
-                            ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, panes.len().to_string(), medium(10.5), MUTED);
-                            // Ein Icon pro Terminal, mit Status-Ring
-                            let mut x = r.left() + 26.0 + 9.0;
-                            let y = r.top() + 39.0;
-                            for id in &panes {
-                                let c = pos2(x, y);
-                                let status = self.terms.get(id).map_or(Status::Idle, |t| t.status());
-                                status_ring(ui.painter(), c, status, now);
-                                if status != Status::Idle {
-                                    animate = true;
-                                }
-                                let stored = s.agents.get(id).and_then(|a| agents::get(a));
-                                // Was gerade wirklich läuft, hat Vorrang vor dem Agent, mit dem die Pane gestartet wurde.
-                                let agent = match self.terms.get(id) {
-                                    Some(t) => {
-                                        let fg = t.foreground();
-                                        agents::by_process(&fg).or(if fg == t.shell_name { None } else { stored })
-                                    }
-                                    None => stored,
-                                }
-                                .unwrap_or(&AGENTS[0]);
-                                agent.paint_logo(ui, Rect::from_center_size(c, vec2(14.0, 14.0)), false);
-                                x += 26.0;
-                            }
+                        if tresp.drag_started() {
+                            egui::DragAndDrop::set_payload(&ctx, PaneDrag(*id));
                         }
-                        if resp.clicked() {
-                            cmds.push(Cmd::Select(pi, si));
+                        if tresp.dragged() {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                         }
-                        resp.context_menu(|ui| {
-                            ui.set_min_width(160.0);
-                            if menu_item(ui, "Rename…") {
-                                cmds.push(Cmd::Rename(Rename::Session(pi, si), s.name.clone()));
-                            }
-                            ui.separator();
-                            if menu_item_danger(ui, "Close session") {
-                                cmds.push(Cmd::CloseSession(pi, si));
-                            }
-                        });
+                        if tresp.clicked() {
+                            cmds.push(SideCmd::Focus(pi, si, *id));
+                        }
+                        tresp.on_hover_text("Click to focus · drag onto a terminal or another session to move it");
                     }
                 }
-                ui.add_space(6.0);
+                ui.add_space(8.0);
             }
         });
 
@@ -814,8 +1042,17 @@ impl App {
         }
         for c in cmds {
             match c {
-                Cmd::Select(p, s) => self.select(p, s),
-                Cmd::Toggle(p) => {
+                SideCmd::Select(p, s) => self.select(p, s),
+                SideCmd::Focus(p, s, id) => {
+                    if (p, s) != (self.store.project, self.store.session) {
+                        self.select(p, s);
+                    }
+                    self.focused = Some(id);
+                    if self.maximized.is_some() {
+                        self.maximized = Some(id);
+                    }
+                }
+                SideCmd::Toggle(p) => {
                     if p == self.store.project {
                         self.store.projects[p].expanded ^= true;
                     } else {
@@ -823,10 +1060,19 @@ impl App {
                         self.select(p, 0);
                     }
                 }
-                Cmd::NewSession(p) => self.new_session(p),
-                Cmd::CloseSession(p, s) => self.close_session(p, s),
-                Cmd::Rename(t, n) => self.modal = Some(Modal::Rename(t, n)),
-                Cmd::Remove(p) => self.modal = Some(Modal::RemoveProject(p)),
+                SideCmd::NewSession(p) => self.new_session(p),
+                SideCmd::CloseSession(p, s) => self.close_session(p, s),
+                SideCmd::Rename(t, n) => self.modal = Some(Modal::Rename(t, n)),
+                SideCmd::Remove(p) => self.modal = Some(Modal::RemoveProject(p)),
+                SideCmd::Move(id, s) => {
+                    // Session gehört zum Projekt der Pane, nicht unbedingt zum aktuellen
+                    if let Some(p) = self.store.projects.iter().position(|p| p.sessions.iter().any(|x| x.grid.contains(id))) {
+                        if p != self.store.project {
+                            self.store.project = p;
+                        }
+                        self.move_pane(id, None, Some(s));
+                    }
+                }
             }
         }
     }
@@ -841,6 +1087,18 @@ impl App {
         }
         if self.session().is_none_or(|s| s.grid.is_empty()) {
             self.launcher(ui, rect);
+            // Terminal aus einer anderen Session hierher ziehen
+            if let Some(d) = egui::DragAndDrop::payload::<PaneDrag>(ui.ctx()).map(|d| d.0) {
+                if self.project().is_some_and(|p| p.sessions.iter().any(|s| s.grid.contains(d))) && ui.rect_contains_pointer(rect) {
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pane_drop")));
+                    painter.rect(rect.shrink(4.0), RADIUS, ACCENT.gamma_multiply(0.06), Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                    painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Move terminal into this session", medium(14.0), ACCENT);
+                    if ui.input(|i| i.pointer.any_released()) {
+                        let s = self.store.session;
+                        self.move_pane(d, None, Some(s));
+                    }
+                }
+            }
             return;
         }
 
@@ -851,7 +1109,7 @@ impl App {
 
         for id in grid.panes() {
             if !self.terms.contains_key(&id) {
-                match Terminal::spawn(&cwd, argv.as_deref(), ctx.clone()) {
+                match Terminal::spawn(&cwd, argv.as_deref(), id, ctx.clone()) {
                     Ok(mut t) => {
                         if let Some(cmd) = self.pending.remove(&id) {
                             t.write(format!("{cmd}\r").as_bytes());
@@ -872,6 +1130,7 @@ impl App {
         }
         self.store.projects[pi].sessions[si].grid = grid;
 
+        self.pane_drop(ui, &mut actions);
         self.handle_drop(ui);
 
         // Beendete Shells (z.B. `exit`) schließen ihre Pane
@@ -928,7 +1187,6 @@ impl App {
     }
 
     fn pane(&mut self, ui: &mut egui::Ui, id: PaneId, rect: Rect, grid: &Grid, input: bool, actions: &mut Vec<Action>) {
-        const HEAD: f32 = 36.0;
         let focused = self.focused == Some(id);
         let painter = ui.painter().clone();
         painter.rect_filled(rect, RADIUS, PANE);
@@ -938,7 +1196,16 @@ impl App {
         painter.line_segment([head.left_bottom() + vec2(1.0, 0.0), head.right_bottom() - vec2(1.0, 0.0)], Stroke::new(1.0, BORDER));
 
         // Header-Fläche zuerst registrieren, damit die Buttons darüber liegen und Klicks bekommen.
-        let head_resp = ui.interact(head, ui.id().with(("head", id)), Sense::click());
+        // Über die Kopfzeile lässt sich das Terminal verschieben.
+        let head_resp = ui.interact(head, ui.id().with(("head", id)), Sense::click_and_drag());
+        if head_resp.drag_started() {
+            egui::DragAndDrop::set_payload(ui.ctx(), PaneDrag(id));
+        }
+        if head_resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if head_resp.hovered() && grid.len() > 1 {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
 
         let full = grid.is_full();
         let maxed = self.maximized == Some(id);
@@ -955,26 +1222,35 @@ impl App {
             icons::draw(ui.painter(), r.center(), icon, col);
             resp.on_hover_text(tip).clicked()
         };
-        if btn(ui, Icon::Close, "Close  Ctrl+W") {
+        let kb = self.keybinds.clone();
+        if btn(ui, Icon::Close, &kb.tip("Close", Cmd::Close)) {
             actions.push(Action::Close(id));
         }
-        if !full && btn(ui, Icon::Plus, "New terminal  Ctrl+T") {
+        if !full && btn(ui, Icon::Plus, &kb.tip("New terminal", Cmd::NewTerminal)) {
             actions.push(Action::New);
         }
         if grid.len() > 1 {
-            let (icon, tip) = if maxed { (Icon::Restore, "Restore") } else { (Icon::Maximize, "Maximize  Ctrl+Shift+Enter") };
-            if btn(ui, icon, tip) {
+            let tip = if maxed { kb.tip("Restore", Cmd::Maximize) } else { kb.tip("Maximize", Cmd::Maximize) };
+            if btn(ui, if maxed { Icon::Restore } else { Icon::Maximize }, &tip) {
                 actions.push(Action::ToggleMax(id));
             }
         }
-        if !full && btn(ui, Icon::SplitDown, "Split down  Ctrl+Shift+E") {
+        if !full && btn(ui, Icon::SplitDown, &kb.tip("Split down", Cmd::SplitDown)) {
             actions.push(Action::SplitDown(id));
         }
-        if !full && btn(ui, Icon::SplitRight, "Split right  Ctrl+Shift+D") {
+        if !full && btn(ui, Icon::SplitRight, &kb.tip("Split right", Cmd::SplitRight)) {
             actions.push(Action::SplitRight(id));
         }
         let buttons_left = x + 12.0;
 
+        let status = self.status(id);
+        let others: Vec<(usize, String)> = self.store.projects[self.store.project]
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != self.store.session && !s.grid.is_full())
+            .map(|(i, s)| (i, s.name.clone()))
+            .collect();
         let session = self.store.projects[self.store.project].sessions.get(self.store.session);
         let custom = session.and_then(|s| s.names.get(&id).cloned());
         let agent = session.and_then(|s| s.agents.get(&id)).and_then(|a| agents::get(a));
@@ -987,7 +1263,8 @@ impl App {
         // Titel: Status-Punkt (+ Agent-Logo) und der aktuell laufende Befehl bzw. eigener Name
         let tp = painter.with_clip_rect(Rect::from_min_max(head.min, pos2(buttons_left, head.max.y)));
         let mut tx = head.left() + 14.0;
-        tp.circle_filled(pos2(tx + 3.0, head.center().y), 3.5, if term.is_alive() { GREEN } else { FAINT });
+        let dot = if !term.is_alive() { FAINT } else if status == Status::Idle { GREEN } else { status_color(status) };
+        tp.circle_filled(pos2(tx + 3.0, head.center().y), 3.5, dot);
         tx += 14.0;
         if let Some(a) = agent {
             let r = Rect::from_min_size(pos2(tx, head.center().y - 8.0), vec2(16.0, 16.0));
@@ -1005,6 +1282,10 @@ impl App {
         }
         job.append(&location, 12.0, fmt(mono(11.5), FAINT));
         let galley = ui.fonts_mut(|f| f.layout_job(job));
+        // Zustand rechts neben dem Titel, vor den Buttons
+        let pill_row = Rect::from_min_max(head.min, pos2(buttons_left, head.max.y));
+        let pill = if status == Status::Idle { None } else { status_pill(ui, status, pill_row) };
+        let tp = tp.with_clip_rect(Rect::from_min_max(head.min, pos2(pill.map_or(buttons_left, |p| p.left() - 8.0), head.max.y)));
         tp.galley(pos2(tx, head.center().y - galley.size().y / 2.0), galley, TEXT);
 
         let body = Rect::from_min_max(pos2(rect.left() + 2.0, head.bottom()), rect.max - vec2(2.0, 4.0));
@@ -1018,18 +1299,32 @@ impl App {
         }
         let menu = |ui: &mut egui::Ui, actions: &mut Vec<Action>| {
             ui.set_min_width(190.0);
-            if ui.add_enabled(!full, menu_button("Split right", "Ctrl+Shift+D")).clicked() {
+            if ui.add_enabled(!full, menu_button("Split right", &kb.text(Cmd::SplitRight))).clicked() {
                 actions.push(Action::SplitRight(id));
             }
-            if ui.add_enabled(!full, menu_button("Split down", "Ctrl+Shift+E")).clicked() {
+            if ui.add_enabled(!full, menu_button("Split down", &kb.text(Cmd::SplitDown))).clicked() {
                 actions.push(Action::SplitDown(id));
             }
-            if grid.len() > 1 && ui.add(menu_button(if maxed { "Restore" } else { "Maximize" }, "Ctrl+Shift+Enter")).clicked() {
+            if grid.len() > 1 && ui.add(menu_button(if maxed { "Restore" } else { "Maximize" }, &kb.text(Cmd::Maximize))).clicked() {
                 actions.push(Action::ToggleMax(id));
             }
             if menu_item(ui, "Rename…") {
                 actions.push(Action::Rename(id));
             }
+            ui.menu_button("Move to session", |ui| {
+                ui.set_min_width(170.0);
+                for (i, name) in &others {
+                    if menu_item(ui, name) {
+                        actions.push(Action::MoveToSession(id, Some(*i)));
+                    }
+                }
+                if !others.is_empty() {
+                    ui.separator();
+                }
+                if menu_item(ui, "New session") {
+                    actions.push(Action::MoveToSession(id, None));
+                }
+            });
             ui.separator();
             if menu_item_danger(ui, "Close terminal") {
                 actions.push(Action::Close(id));
@@ -1047,8 +1342,59 @@ impl App {
             painter.text(body.center(), egui::Align2::CENTER_CENTER, "Drop to insert path", medium(14.0), ACCENT);
         }
 
+        if egui::DragAndDrop::payload::<PaneDrag>(ui.ctx()).is_some_and(|d| d.0 == id) {
+            painter.rect_filled(rect, RADIUS, BG.gamma_multiply(0.55));
+        }
         let stroke = if drop_here { Stroke::new(1.0, ACCENT.gamma_multiply(0.75)) } else if focused { Stroke::new(1.0, BORDER_STRONG) } else { Stroke::new(1.0, BORDER) };
         painter.rect_stroke(rect, RADIUS, stroke, egui::StrokeKind::Inside);
+    }
+
+    /// Zeigt beim Ziehen eines Terminals, wo es landet, und verschiebt es beim Loslassen.
+    fn pane_drop(&mut self, ui: &egui::Ui, actions: &mut Vec<Action>) {
+        let Some(drag) = egui::DragAndDrop::payload::<PaneDrag>(ui.ctx()).map(|d| d.0) else { return };
+        let Some(pos) = ui.input(|i| i.pointer.latest_pos()) else { return };
+        // Nur innerhalb eines Projekts (gleicher Ordner bzw. Server)
+        if !self.project().is_some_and(|p| p.sessions.iter().any(|s| s.grid.contains(drag))) {
+            return;
+        }
+        let Some(&(target, r)) = self.pane_rects.iter().find(|(id, r)| *id != drag && r.contains(pos)) else { return };
+        let fx = (pos.x - r.left()) / r.width();
+        let fy = (pos.y - r.top()) / r.height();
+        let side = if (0.3..0.7).contains(&fx) && (0.3..0.7).contains(&fy) {
+            Side::Center
+        } else {
+            [(fx, Side::Left), (1.0 - fx, Side::Right), (fy, Side::Top), (1.0 - fy, Side::Bottom)]
+                .into_iter()
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, s)| s)
+                .unwrap()
+        };
+        let Some(grid) = self.session().map(|s| s.grid.clone()) else { return };
+        let mut test = grid.clone();
+        let ok = if grid.contains(drag) { test.move_pane(drag, target, side) } else { test.place(drag, target, side) };
+        let zone = match side {
+            Side::Left => Rect::from_min_max(r.min, pos2(r.center().x, r.bottom())),
+            Side::Right => Rect::from_min_max(pos2(r.center().x, r.top()), r.max),
+            Side::Top => Rect::from_min_max(r.min, pos2(r.right(), r.center().y)),
+            Side::Bottom => Rect::from_min_max(pos2(r.left(), r.center().y), r.max),
+            Side::Center => r,
+        }
+        .shrink(6.0);
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pane_drop")));
+        let col = if ok { ACCENT } else { RED };
+        painter.rect(zone, RADIUS, col.gamma_multiply(0.08), Stroke::new(1.0, col.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+        let text = match (ok, side) {
+            (false, _) => "No space here",
+            (true, Side::Center) => "Swap",
+            (true, Side::Left) => "Move left",
+            (true, Side::Right) => "Move right",
+            (true, Side::Top) => "Move up",
+            (true, Side::Bottom) => "Move down",
+        };
+        painter.text(zone.center(), egui::Align2::CENTER_CENTER, text, medium(13.5), col);
+        if ok && ui.input(|i| i.pointer.any_released()) {
+            actions.push(Action::Move(drag, target, side));
+        }
     }
 
     /// Fügt Pfade von per Drag & Drop abgelegten Dateien in das Terminal unter dem Mauszeiger ein.
@@ -1124,12 +1470,14 @@ impl App {
                             }
                         }
                         ui.add_space(26.0);
-                        ui.horizontal(|ui| {
-                            keycap(ui, "Ctrl");
-                            keycap(ui, "Shift");
-                            keycap(ui, "T");
-                            ui.label(RichText::new("new terminal").color(FAINT).font(font(12.0)));
-                        });
+                        if let Some(b) = self.keybinds.get(Cmd::NewTerminal) {
+                            ui.horizontal(|ui| {
+                                for k in b.text().split('+').filter(|k| !k.is_empty()) {
+                                    keycap(ui, k);
+                                }
+                                ui.label(RichText::new("new terminal").color(FAINT).font(font(12.0)));
+                            });
+                        }
                         ui.add_space(40.0);
                     });
                 });
@@ -1515,34 +1863,72 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
     ui.painter().galley(r.center() - galley.size() / 2.0, galley, MUTED);
 }
 
-/// Kreis um ein Terminal-Icon: grüner drehender Ladebogen = arbeitet,
-/// gelb blinkend = Frage/Freigabe, rot blinkend = Fehler, nichts = untätig.
-fn status_ring(p: &egui::Painter, c: egui::Pos2, status: Status, t: f64) {
-    const R: f32 = 11.0;
-    let blink = (0.5 + 0.5 * (t * 6.0).sin()) as f32;
+/// Reihenfolge für die Zusammenfassung mehrerer Terminals (höher = wichtiger).
+fn urgency(s: Status) -> u8 {
+    match s {
+        Status::Idle => 0,
+        Status::Done => 1,
+        Status::Working => 2,
+        Status::Error => 3,
+        Status::Question => 4,
+        Status::Permission => 5,
+    }
+}
+
+fn status_color(s: Status) -> Color32 {
+    match s {
+        Status::Idle => FAINT,
+        Status::Working | Status::Done => GREEN,
+        Status::Question => BLUE,
+        Status::Permission => AMBER,
+        Status::Error => RED,
+    }
+}
+
+/// Kleines Etikett rechts in einer Zeile ("Working", "Permission", ...). Gibt seine Fläche zurück.
+fn status_pill(ui: &egui::Ui, st: Status, row: Rect) -> Option<Rect> {
+    if st == Status::Idle {
+        return None;
+    }
+    let col = status_color(st);
+    let galley = ui.painter().layout_no_wrap(st.label().to_string(), medium(10.5), col);
+    let w = galley.size().x + if st == Status::Done { 26.0 } else { 14.0 };
+    let r = Rect::from_center_size(pos2(row.right() - 6.0 - w / 2.0, row.center().y), vec2(w, 18.0));
+    ui.painter().rect_filled(r, 9.0, col.gamma_multiply(0.14));
+    let mut x = r.left() + 7.0;
+    if st == Status::Done {
+        icons::draw(ui.painter(), pos2(x + 5.0, r.center().y), Icon::Check, col);
+        x += 12.0;
+    }
+    ui.painter().galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, col);
+    Some(r)
+}
+
+/// Kreis um ein Terminal-Icon: grüner drehender Ladebogen = arbeitet, blau = Frage,
+/// gelb = wartet auf Freigabe (beide pulsierend), grün = fertig, rot = Fehler.
+fn status_ring(p: &egui::Painter, c: egui::Pos2, status: Status, t: f64, r: f32) {
+    let pulse = (0.5 + 0.5 * (t * 5.0).sin()) as f32;
+    let col = status_color(status);
     match status {
         Status::Idle => {}
         Status::Working => {
-            p.circle_stroke(c, R, Stroke::new(2.0, GREEN.gamma_multiply(0.18)));
+            p.circle_stroke(c, r, Stroke::new(1.8, col.gamma_multiply(0.18)));
             let start = (t * 5.0) as f32;
-            let pts: Vec<egui::Pos2> =
-                (0..=24).map(|k| c + egui::Vec2::angled(start + k as f32 / 24.0 * 4.2) * R).collect();
-            p.add(egui::Shape::line(pts, Stroke::new(2.0, GREEN)));
+            let pts: Vec<egui::Pos2> = (0..=24).map(|k| c + egui::Vec2::angled(start + k as f32 / 24.0 * 4.2) * r).collect();
+            p.add(egui::Shape::line(pts, Stroke::new(1.8, col)));
         }
-        Status::Question | Status::Error => {
-            let col = if status == Status::Error { RED } else { Color32::from_rgb(0xfa, 0xcc, 0x15) };
-            let a = 0.2 + 0.8 * blink;
-            p.circle_filled(c, R, col.gamma_multiply(0.15 * a));
-            p.circle_stroke(c, R, Stroke::new(2.0, col.gamma_multiply(a)));
+        Status::Question | Status::Permission => {
+            let a = 0.3 + 0.7 * pulse;
+            p.circle_filled(c, r, col.gamma_multiply(0.15 * a));
+            p.circle_stroke(c, r, Stroke::new(1.8, col.gamma_multiply(a)));
+        }
+        Status::Done | Status::Error => {
+            p.circle_stroke(c, r, Stroke::new(1.8, col.gamma_multiply(0.8)));
         }
     }
 }
 
 const FOLDER_SVG: &[u8] = include_bytes!("../assets/logos/folder.svg");
-
-fn draw_small(p: &egui::Painter, c: egui::Pos2, icon: Icon, col: Color32) {
-    icons::draw(p, c, icon, col);
-}
 
 fn menu_item(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(egui::Button::new(RichText::new(text).font(font(13.0))).frame(false).min_size(vec2(ui.available_width(), 28.0)))
@@ -1554,9 +1940,9 @@ fn menu_item_danger(ui: &mut egui::Ui, text: &str) -> bool {
         .clicked()
 }
 
-fn menu_button<'a>(text: &'a str, shortcut: &'a str) -> egui::Button<'a> {
+fn menu_button<'a>(text: &'a str, shortcut: &str) -> egui::Button<'a> {
     egui::Button::new(RichText::new(text).font(font(13.0)))
-        .shortcut_text(RichText::new(shortcut).font(font(11.5)).color(FAINT))
+        .shortcut_text(RichText::new(shortcut.to_string()).font(font(11.5)).color(FAINT))
         .frame(false)
         .min_size(vec2(190.0, 28.0))
 }
@@ -1605,12 +1991,14 @@ fn ghost_button(text: &str, w: f32) -> egui::Button<'_> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_status(&ctx);
         self.telegram();
         // Telegram-Nachrichten und Agent-Status auch ohne Eingaben weiter verarbeiten
-        ctx.request_repaint_after(Duration::from_secs(1));
+        ctx.request_repaint_after(Duration::from_millis(500));
 
         if let Some(s) = &mut self.settings {
             if !settings::show(ui, s) {
+                self.keybinds = s.keybinds.clone();
                 self.settings = None;
             }
             return;
@@ -1634,6 +2022,16 @@ impl eframe::App for App {
             .show(ui, |ui| self.workspace(ui, input));
 
         self.modals(&ctx);
+
+        // Vorschau des gezogenen Terminals am Mauszeiger
+        if let (Some(d), Some(pos)) = (egui::DragAndDrop::payload::<PaneDrag>(&ctx), ctx.pointer_latest_pos()) {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_ghost")));
+            let label = self.pane_label(d.0);
+            let galley = painter.layout_no_wrap(label, medium(12.5), TEXT);
+            let r = Rect::from_min_size(pos + vec2(14.0, 12.0), galley.size() + vec2(20.0, 12.0));
+            painter.rect(r, 8.0, ELEVATED, Stroke::new(1.0, BORDER_STRONG), egui::StrokeKind::Inside);
+            painter.galley(r.min + vec2(10.0, 6.0), galley, TEXT);
+        }
     }
 
     fn on_exit(&mut self) {

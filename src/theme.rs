@@ -15,11 +15,15 @@ pub const SELECTED: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x26);
 pub const ACCENT: Color32 = Color32::from_rgb(0xe4, 0xe4, 0xe7);
 pub const GREEN: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
 pub const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+pub const AMBER: Color32 = Color32::from_rgb(0xfa, 0xcc, 0x15);
+pub const BLUE: Color32 = Color32::from_rgb(0x60, 0xa5, 0xfa);
 pub const TEXT: Color32 = Color32::from_rgb(0xed, 0xed, 0xef);
 pub const MUTED: Color32 = Color32::from_rgb(0x8f, 0x8f, 0x99);
 pub const FAINT: Color32 = Color32::from_rgb(0x5c, 0x5c, 0x66);
 
 pub const RADIUS: u8 = 12;
+/// Höhe der Kopfzeilen von Sidebar, Settings-Navigation und Terminals.
+pub const HEAD: f32 = 36.0;
 
 pub fn font(size: f32) -> FontId {
     FontId::proportional(size)

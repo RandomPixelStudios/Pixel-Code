@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pixel Code
+GenericName=AI Coding Terminal
+Comment=Run Claude Code, Codex, OpenCode and other coding agents side by side
+Exec=pixel-code
+Icon=pixel-code
+Terminal=false
+Categories=Development;IDE;TerminalEmulator;
+Keywords=terminal;agent;ai;claude;codex;opencode;
+StartupWMClass=pixel-code

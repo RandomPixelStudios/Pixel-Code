@@ -6,6 +6,17 @@ pub const MAX_COLS: usize = 4;
 pub const MAX_ROWS: usize = 2;
 pub const MAX_PANES: usize = MAX_COLS * MAX_ROWS;
 
+/// Wo eine gezogene Pane relativ zur Ziel-Pane landet.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    /// Plätze tauschen
+    Center,
+}
+
 /// Raster aus Terminal-Panes: höchstens 2 Zeilen mit je höchstens 4 Spalten.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Grid {
@@ -112,5 +123,103 @@ impl Grid {
             self.rows[r].remove(c);
             self.reset();
         }
+    }
+
+    /// Verschiebt eine Pane dieses Rasters neben `target`. Die übrigen Panes rücken nach.
+    pub fn move_pane(&mut self, id: PaneId, target: PaneId, side: Side) -> bool {
+        if id == target {
+            return false;
+        }
+        let (Some((r1, c1)), Some((r2, c2))) = (self.pos(id), self.pos(target)) else { return false };
+        if side == Side::Center {
+            self.rows[r1][c1] = target;
+            self.rows[r2][c2] = id;
+            return true;
+        }
+        let backup = self.clone();
+        self.rows[r1].remove(c1);
+        self.rows.retain(|r| !r.is_empty());
+        if self.place(id, target, side) {
+            true
+        } else {
+            *self = backup;
+            false
+        }
+    }
+
+    /// Fügt eine fremde Pane (z.B. aus einer anderen Session) neben `target` ein.
+    pub fn place(&mut self, id: PaneId, target: PaneId, side: Side) -> bool {
+        let Some((r, c)) = self.pos(target).filter(|_| !self.is_full() && !self.contains(id)) else { return false };
+        let rows = self.rows.len();
+        match side {
+            Side::Left | Side::Right if self.row_len(r) < MAX_COLS => {
+                self.insert(r, if side == Side::Left { c } else { c + 1 }, id);
+            }
+            Side::Top if r == 1 && self.row_len(0) < MAX_COLS => self.insert(0, c.min(self.row_len(0)), id),
+            Side::Top if r == 0 && rows < MAX_ROWS => {
+                self.rows.insert(0, vec![id]);
+                self.reset();
+            }
+            Side::Bottom if r == 0 && rows < MAX_ROWS => {
+                self.rows.push(vec![id]);
+                self.reset();
+            }
+            Side::Bottom if r == 0 && self.row_len(1) < MAX_COLS => self.insert(1, c.min(self.row_len(1)), id),
+            Side::Center => return self.push(id),
+            _ => return false,
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(rows: &[&[PaneId]]) -> Grid {
+        let mut g = Grid { rows: rows.iter().map(|r| r.to_vec()).collect(), ..Default::default() };
+        g.reset();
+        g
+    }
+
+    #[test]
+    fn move_within_row() {
+        let mut g = grid(&[&[1, 2, 3]]);
+        assert!(g.move_pane(1, 3, Side::Right));
+        assert_eq!(g.rows, vec![vec![2, 3, 1]]);
+        assert!(g.move_pane(1, 2, Side::Center));
+        assert_eq!(g.rows, vec![vec![1, 3, 2]]);
+    }
+
+    #[test]
+    fn move_to_new_row() {
+        let mut g = grid(&[&[1, 2, 3]]);
+        assert!(g.move_pane(3, 1, Side::Bottom));
+        assert_eq!(g.rows, vec![vec![1, 2], vec![3]]);
+        assert!(g.move_pane(1, 3, Side::Left));
+        assert_eq!(g.rows, vec![vec![2], vec![1, 3]]);
+        assert_eq!(g.widths.len(), g.rows.len());
+    }
+
+    #[test]
+    fn moving_last_pane_of_row_up() {
+        let mut g = grid(&[&[1], &[2]]);
+        assert!(g.move_pane(2, 1, Side::Top));
+        assert_eq!(g.rows, vec![vec![2], vec![1]]);
+    }
+
+    #[test]
+    fn full_row_is_rejected_and_restored() {
+        let mut g = grid(&[&[1, 2, 3, 4], &[5]]);
+        assert!(!g.move_pane(5, 1, Side::Left));
+        assert_eq!(g.rows, vec![vec![1, 2, 3, 4], vec![5]]);
+    }
+
+    #[test]
+    fn place_from_other_session() {
+        let mut g = grid(&[&[1]]);
+        assert!(g.place(9, 1, Side::Left));
+        assert_eq!(g.rows, vec![vec![9, 1]]);
+        assert!(!g.place(9, 1, Side::Right));
     }
 }
