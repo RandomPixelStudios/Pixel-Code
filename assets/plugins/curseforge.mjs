@@ -7,11 +7,45 @@ const base = "https://minecraft.curseforge.com/api";
 const headers = { "X-Api-Token": settings.token || "" };
 const [cmd, ...rest] = args;
 const [f, w] = flags(rest);
-if (cmd && cmd !== "help" && !settings.token) fail("No CurseForge API token set.");
+const CORE = "https://api.curseforge.com/v1";
+const core = (path) => {
+  if (!settings.api_key) fail("Listing projects needs a CurseForge Core API key (console.curseforge.com > API keys) in the plugin settings.");
+  return http("GET", CORE + path, { headers: { "x-api-key": settings.api_key } });
+};
+// Autor-ID aus dem Nutzernamen: Suche findet Mods auch über den Autorennamen
+async function authorId(name) {
+  const r = await core(`/mods/search?gameId=432&searchFilter=${encodeURIComponent(name)}&pageSize=50`);
+  const a = r.data.flatMap((m) => m.authors).find((x) => x.name.toLowerCase() === name.toLowerCase());
+  if (!a) fail(`No CurseForge author "${name}" found (check the username in the plugin settings).`);
+  return a.id;
+}
+const modId = async (x) => /^\d+$/.test(x) ? x : (await core(`/mods/search?gameId=432&slug=${encodeURIComponent(x)}`)).data[0]?.id ?? fail("Project not found: " + x);
+if (cmd && !["help", "projects", "files", "info"].includes(cmd) && !settings.token) fail("No CurseForge upload token set.");
 const list = (x) => (x ? String(x).split(",").map((s) => s.trim()).filter(Boolean) : []);
 
 switch (cmd) {
-  case "connect": case "status": { const v = await http("GET", `${base}/game/versions`, { headers }); console.log(`Token valid (${v.length} game versions available)`); break; }
+  case "connect": case "status": {
+    const v = await http("GET", `${base}/game/versions`, { headers });
+    let extra = "";
+    if (settings.api_key && settings.author) { const id = await authorId(settings.author); const r = await core(`/mods/search?gameId=432&authorId=${id}&pageSize=50`); extra = `, ${r.pagination.totalCount} projects by ${settings.author}`; }
+    console.log(`Upload token valid${extra}`);
+    break;
+  }
+  case "projects": {
+    const name = w[0] || settings.author;
+    if (!name) fail("Set your CurseForge username in the plugin settings or pass it: projects <username>");
+    const id = await authorId(name);
+    const out = [];
+    for (let i = 0; ; i += 50) {
+      const r = await core(`/mods/search?gameId=${f.game || 432}&authorId=${id}&pageSize=50&index=${i}&sortField=6&sortOrder=desc`);
+      out.push(...r.data);
+      if (i + 50 >= r.pagination.totalCount || i >= 950) break;
+    }
+    print(out.map((m) => `${m.id}  ${m.name}  (${m.slug})  ${m.downloadCount.toLocaleString("en")} downloads  latest: ${m.latestFilesIndexes?.[0]?.gameVersion ?? "-"}  ${m.links.websiteUrl}`).join("\n") || "No projects found.");
+    break;
+  }
+  case "files": { const id = await modId(w[0]); print((await core(`/mods/${id}/files?pageSize=${f.n || 15}`)).data.map((x) => `${x.id}  ${x.displayName}  ${["", "release", "beta", "alpha"][x.releaseType]}  ${x.gameVersions.join(", ")}  ${x.downloadCount} downloads  ${x.fileDate.slice(0, 10)}`).join("\n")); break; }
+  case "info": { const id = await modId(w[0]); const m = (await core(`/mods/${id}`)).data; print(`${m.name} (${m.slug}, id ${m.id})\n${m.summary}\n${m.downloadCount.toLocaleString("en")} downloads, ${m.thumbsUpCount ?? 0} likes, status ${m.status}\nauthors: ${m.authors.map((a) => a.name).join(", ")}\n${m.links.websiteUrl}`); break; }
   case "game-versions": {
     const types = await http("GET", `${base}/game/version-types`, { headers });
     const v = await http("GET", `${base}/game/versions`, { headers });
@@ -44,6 +78,9 @@ switch (cmd) {
     break;
   }
   default: console.log(`Usage:
+  projects [username] [--game 432]  your projects with downloads (needs the Core API key)
+  files <project id|slug> [--n 15]  latest files of a project
+  info <project id|slug>            project details
   game-versions [filter]     names/ids of Minecraft versions, loaders (Fabric, NeoForge, Forge, Quilt) and Java versions
   upload <project_id> <file.jar> --game-versions 1.21.1,1.21 --loaders Fabric [--java 21] [--env Client,Server]
          [--name ..] [--changelog "markdown"] [--type release|beta|alpha] [--deps fabric-api:requiredDependency]`);

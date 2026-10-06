@@ -603,9 +603,9 @@ pub const DEFS: &[Def] = &[
         id: "curseforge",
         name: "CurseForge",
         description: "Upload Minecraft mod files to CurseForge.",
-        usage: "'game-versions [filter]', 'upload <project_id> <file.jar> --game-versions 1.21.1 --loaders Fabric [--java 21] [--changelog ..] [--type release]'",
+        usage: "'projects [username]', 'files <project>', 'info <project>', 'game-versions [filter]', 'upload <project_id> <file.jar> --game-versions 1.21.1 --loaders Fabric [--java 21] [--changelog ..] [--type release]'",
         logo: logo!("curseforge.svg"),
-        fields: &[field("token", "Upload API token", "legacy.curseforge.com/account/api-tokens", true)],
+        fields: &[field("token", "Upload API token", "legacy.curseforge.com/account/api-tokens", true), field("api_key", "Core API key (for listing projects)", "console.curseforge.com > API keys", true), field("author", "Your CurseForge username", "", false)],
     },
     Def {
         id: "aws",
