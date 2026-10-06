@@ -172,8 +172,16 @@ pub fn newer(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
 }
 
+static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// true, wenn die App für ein Update neu startet (Sitzungen sollen weiterlaufen).
+pub fn restarting() -> bool {
+    RESTARTING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Startet die (neu installierte) App und beendet diese Instanz.
 pub fn restart(ctx: &egui::Context) {
+    RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
     let exe = if std::path::Path::new("/usr/bin/pixel-code").exists() {
         PathBuf::from("/usr/bin/pixel-code")
     } else {

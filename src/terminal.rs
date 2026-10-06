@@ -1,18 +1,19 @@
-use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::os::unix::net::UnixStream;
+
+use crate::ptyhost;
 
 /// Eine laufende Shell in einem Pseudo-Terminal plus der zugehörige Bildschirmzustand.
 pub struct Terminal {
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Verbindung zum PTY-Host, der die Shell besitzt (überlebt Neustarts der App)
+    conn: UnixStream,
+    fg: Arc<Mutex<String>>,
     alive: Arc<AtomicBool>,
     size: (u16, u16),
     scroll: usize,
@@ -65,53 +66,50 @@ impl Status {
 }
 
 impl Terminal {
-    /// Startet die Login-Shell in `cwd`, oder `argv` (z.B. ssh), falls angegeben.
+    /// Hängt sich an die Sitzung `pane` im PTY-Host an oder startet dort die Login-Shell in `cwd`
+    /// (bzw. `argv`, z.B. ssh).
     pub fn spawn(cwd: &Path, argv: Option<&[String]>, pane: u64, ctx: egui::Context) -> anyhow_lite::Result<Self> {
         let size = (24u16, 80u16);
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize { rows: size.0, cols: size.1, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| e.to_string())?;
-
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let mut cmd = match argv {
-            Some(a) if !a.is_empty() => {
-                let mut c = CommandBuilder::new(&a[0]);
-                c.args(&a[1..]);
-                c
-            }
-            _ => CommandBuilder::new(&shell),
-        };
-        cmd.cwd(if cwd.is_dir() { cwd.to_path_buf() } else { dirs::home_dir().unwrap_or_default() });
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| !k.starts_with("PIXEL_CODE_")).collect();
+        env.retain(|(k, _)| k != "TERM" && k != "COLORTERM");
+        env.push(("TERM".into(), "xterm-256color".into()));
+        env.push(("COLORTERM".into(), "truecolor".into()));
         // Für die Status-Hooks des Pixel-Code-Plugins
-        cmd.env("PIXEL_CODE_PANE", pane.to_string());
-        cmd.env("PIXEL_CODE_STATUS_DIR", crate::plugins::status_dir());
-        let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-        drop(pair.slave);
+        env.push(("PIXEL_CODE_PANE".into(), pane.to_string()));
+        env.push(("PIXEL_CODE_STATUS_DIR".into(), crate::plugins::status_dir().display().to_string()));
+
+        let mut conn = ptyhost::connect()?;
+        let attach = ptyhost::Attach {
+            pane,
+            cwd: cwd.to_path_buf(),
+            argv: argv.map(|a| a.to_vec()),
+            env,
+            rows: size.0,
+            cols: size.1,
+            protocol: ptyhost::PROTOCOL,
+        };
+        ptyhost::write_frame(&mut conn, b'A', &serde_json::to_vec(&attach).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(size.0, size.1, 5000)));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
+        let fg = Arc::new(Mutex::new(String::new()));
         let last_output = Arc::new(Mutex::new(Instant::now()));
         {
-            let parser = parser.clone();
-            let alive = alive.clone();
-            let last_output = last_output.clone();
+            let mut reader = conn.try_clone().map_err(|e| e.to_string())?;
+            let (parser, alive, fg, last_output) = (parser.clone(), alive.clone(), fg.clone(), last_output.clone());
             std::thread::spawn(move || {
-                let mut buf = [0u8; 16 * 1024];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            parser.lock().unwrap().process(&buf[..n]);
+                while let Ok((kind, data)) = ptyhost::read_frame(&mut reader) {
+                    match kind {
+                        b'O' => {
+                            parser.lock().unwrap().process(&data);
                             *last_output.lock().unwrap() = Instant::now();
-                            ctx.request_repaint();
                         }
+                        b'F' => *fg.lock().unwrap() = String::from_utf8_lossy(&data).into_owned(),
+                        b'X' => break,
+                        _ => {}
                     }
+                    ctx.request_repaint();
                 }
                 alive.store(false, Ordering::SeqCst);
                 ctx.request_repaint();
@@ -123,7 +121,13 @@ impl Terminal {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shell".into());
 
-        Ok(Self { parser, writer, master: pair.master, child, alive, size, scroll: 0, scroll_acc: 0.0, shell_name, selection: None, last_output, last_input: Instant::now() })
+        Ok(Self { parser, conn, fg, alive, size, scroll: 0, scroll_acc: 0.0, shell_name, selection: None, last_output, last_input: Instant::now() })
+    }
+
+    /// Beendet die Shell bzw. den Agent (beim Schließen des Terminals).
+    pub fn kill(&mut self) {
+        let _ = ptyhost::write_frame(&mut self.conn, b'K', b"");
+        self.alive.store(false, Ordering::SeqCst);
     }
 
     /// Zeitpunkt der letzten Eingabe des Nutzers.
@@ -137,12 +141,8 @@ impl Terminal {
 
     /// Name des Prozesses, der gerade im Vordergrund des Terminals läuft (z.B. `vim`, `claude`).
     pub fn foreground(&self) -> String {
-        self.master
-            .process_group_leader()
-            .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.shell_name.clone())
+        let fg = self.fg.lock().unwrap().clone();
+        if fg.is_empty() { self.shell_name.clone() } else { fg }
     }
 
     /// Markierter Text, falls etwas markiert ist.
@@ -158,8 +158,7 @@ impl Terminal {
 
     /// Schreibt an das Programm, ohne Scroll-Position und Markierung anzufassen.
     fn write_raw(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let _ = ptyhost::write_frame(&mut self.conn, b'I', bytes);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -169,8 +168,7 @@ impl Terminal {
             self.parser.lock().unwrap().screen_mut().set_scrollback(0);
         }
         self.last_input = Instant::now();
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let _ = ptyhost::write_frame(&mut self.conn, b'I', bytes);
     }
 
     /// Heuristik: Fragen/Freigaben und Fehler werden am Bildschirmtext erkannt,
@@ -219,7 +217,8 @@ impl Terminal {
             return;
         }
         self.size = (rows, cols);
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        let size = serde_json::to_vec(&ptyhost::Size { rows, cols }).unwrap_or_default();
+        let _ = ptyhost::write_frame(&mut self.conn, b'R', &size);
         self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
     }
 
@@ -432,11 +431,8 @@ impl Terminal {
     }
 }
 
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-    }
-}
+// Kein Drop-Kill: wird die App beendet, läuft die Sitzung im PTY-Host weiter.
+// Geschlossene Terminals beendet `kill()`.
 
 fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     use egui::Key::*;

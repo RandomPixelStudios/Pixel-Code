@@ -3,6 +3,7 @@ mod icons;
 mod keybinds;
 mod layout;
 mod plugins;
+mod ptyhost;
 mod settings;
 mod telegram;
 mod terminal;
@@ -48,6 +49,10 @@ fn import_login_path() {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| a == "--pty-host") {
+        ptyhost::run_host();
+        return Ok(());
+    }
     import_login_path();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -327,6 +332,16 @@ impl App {
         let _ = std::fs::remove_dir_all(plugins::status_dir());
         app.updater.check(ctx.clone());
         app.select(app.store.project, app.store.session);
+        // Sitzungen im PTY-Host, die zu keinem Terminal mehr gehören (z.B. nach einem Absturz), beenden
+        {
+            let known: std::collections::HashSet<PaneId> =
+                app.store.projects.iter().flat_map(|p| &p.sessions).flat_map(|s| s.grid.panes()).collect();
+            std::thread::spawn(move || {
+                for id in ptyhost::list().into_iter().filter(|id| !known.contains(id)) {
+                    ptyhost::kill(id);
+                }
+            });
+        }
         // Plugin-Registry (GitHub-Status) für die Agents aktuell halten
         let _ = plugins::GitHub::new(ctx.clone());
         plugins::refresh_all(ctx.clone());
@@ -440,7 +455,9 @@ impl App {
     }
 
     fn close_pane(&mut self, id: PaneId) {
-        self.terms.remove(&id);
+        if let Some(mut t) = self.terms.remove(&id) {
+            t.kill();
+        }
         let _ = std::fs::remove_file(plugins::status_dir().join(id.to_string()));
         self.pending.remove(&id);
         for p in &mut self.store.projects {
@@ -463,7 +480,11 @@ impl App {
     fn close_session(&mut self, p: usize, s: usize) {
         let session = self.store.projects[p].sessions.remove(s);
         for id in session.grid.panes() {
-            self.terms.remove(&id);
+            if let Some(mut t) = self.terms.remove(&id) {
+                t.kill();
+            } else {
+                ptyhost::kill(id);
+            }
         }
         let (cp, cs) = (self.store.project, self.store.session);
         let cs = if cp == p && s < cs { cs - 1 } else { cs };
@@ -474,7 +495,11 @@ impl App {
         let p = self.store.projects.remove(i);
         for s in p.sessions {
             for id in s.grid.panes() {
-                self.terms.remove(&id);
+                if let Some(mut t) = self.terms.remove(&id) {
+                    t.kill();
+                } else {
+                    ptyhost::kill(id);
+                }
             }
         }
         let cur = self.store.project;
@@ -2225,5 +2250,17 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         App::save(self);
+        // Beim Neustart nach einem Update laufen Shells und Agents im PTY-Host weiter,
+        // beim normalen Schließen werden sie beendet.
+        if !update::restarting() {
+            let live = ptyhost::list();
+            let mine: Vec<PaneId> = self.store.projects.iter().flat_map(|p| &p.sessions).flat_map(|s| s.grid.panes()).collect();
+            for id in mine.into_iter().filter(|id| live.contains(id)) {
+                match self.terms.get_mut(&id) {
+                    Some(t) => t.kill(),
+                    None => ptyhost::kill(id),
+                }
+            }
+        }
     }
 }
