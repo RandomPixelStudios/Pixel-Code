@@ -346,7 +346,12 @@ impl App {
         let _ = plugins::GitHub::new(ctx.clone());
         plugins::refresh_all(ctx.clone());
         // Pixel-Code-Plugin aktuell halten, auch wenn der Agent außerhalb der App gestartet wird
-        for id in ["opencode", "omp", "claude", "codex", "gemini", "kimi", "cursor", "qwen", "copilot", "amp", "crush", "kilo", "iflow", "junie", "openhands", "letta", "pi", "cline", "openclaw", "hermes", "strix", "proto"] {
+        for id in [
+            "opencode", "omp", "claude", "codex", "gemini", "kimi", "cursor", "qwen", "copilot", "amp",
+            "crush", "kilo", "iflow", "junie", "openhands", "letta", "pi", "cline", "openclaw", "hermes",
+            "strix", "proto", "roocode", "qcli", "openinterpreter", "codewhale", "dexto",
+            "forgecode", "opensquilla", "everycode", "nanocoder", "claudin", "primeagent"
+        ] {
             if agents::get(id).and_then(|a| a.bin).is_some_and(agents::is_installed) {
                 plugins::install_agent_plugin(id);
             }

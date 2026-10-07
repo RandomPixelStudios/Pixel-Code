@@ -2873,7 +2873,16 @@ fn install_mcp(agent: &str, bin: &str) {
         }
         "hermes" => merge_hermes(&home.join(".hermes/config.yaml"), &node_s, &script_s),
         "strix" => merge_strix(&home.join(".strix/mcp-servers.json"), &node_s, &script_s),
-        "letta" => install_letta_skill(&home, &node_s, &script_s),
+        "roocode" => merge_json(&home.join(".roo/mcp.json"), "mcpServers", stdio),
+        "everycode" => merge_json(&home.join(".everycode/config.json"), "mcpServers", stdio),
+        "qcli" => merge_json(&home.join(".aws/amazonq/mcp.json"), "mcpServers", stdio),
+        "openinterpreter" => merge_json(&home.join(".openinterpreter/mcp.json"), "mcpServers", stdio),
+        "opensquilla" => merge_json(&home.join(".opensquilla/mcp.json"), "mcpServers", stdio),
+        "dexto" => merge_json(&home.join(".dexto/mcp.json"), "mcpServers", stdio),
+        "forgecode" => merge_json(&home.join(".forgecode/mcp.json"), "mcpServers", stdio),
+        "nanocoder" => merge_json(&home.join(".nanocoder/mcp.json"), "mcpServers", stdio),
+        "claudin" => merge_json(&home.join(".claudin/mcp.json"), "mcpServers", stdio),
+        "primeagent" => merge_json(&home.join(".primeagent/mcp.json"), "mcpServers", stdio),
         _ => {}
     }
 }
@@ -3011,6 +3020,13 @@ fn install_status_hooks(agent: &str, home: &std::path::Path) {
         "qwen" => merge_hooks(&home.join(".qwen/settings.json"), GEMINI, false),
         "iflow" => merge_hooks(&home.join(".iflow/settings.json"), IFLOW, true),
         "proto" => merge_hooks(&home.join(".proto/settings.json"), GEMINI, false),
+        "roocode" => merge_hooks(&home.join(".roo/settings.json"), CLAUDE, true),
+        "qcli" => merge_hooks(&home.join(".aws/amazonq/settings.json"), CLAUDE, true),
+        "openinterpreter" => merge_hooks(&home.join(".openinterpreter/settings.json"), GEMINI, false),
+        "dexto" => merge_hooks(&home.join(".dexto/settings.json"), GEMINI, false),
+        "forgecode" => merge_hooks(&home.join(".forgecode/settings.json"), GEMINI, false),
+        "opensquilla" => merge_hooks(&home.join(".opensquilla/settings.json"), GEMINI, false),
+        "everycode" => merge_hooks(&home.join(".everycode/settings.json"), GEMINI, false),
         _ => {}
     }
 }

@@ -134,6 +134,19 @@ pub const AGENTS: &[Agent] = &[
     Agent { id: "openclaw", name: "OpenClaw", bin: Some("openclaw"), install: Some("npm install -g openclaw"), logo: svg!("openclaw-color.svg") },
     Agent { id: "strix", name: "Strix", bin: Some("strix"), install: Some("curl -sSL https://strix.ai/install | bash"), logo: svg!("strix.png") },
     Agent { id: "proto", name: "Proto", bin: Some("proto"), install: Some("npm install -g @protolabsai/proto"), logo: svg!("proto.svg") },
+    Agent { id: "roocode", name: "Roo Code CLI", bin: Some("roo"), install: Some("curl -fsSL https://raw.githubusercontent.com/RooCodeInc/Roo-Code/main/apps/cli/install.sh | sh"), logo: svg!("roocode.svg") },
+    Agent { id: "qcli", name: "Amazon Q CLI", bin: Some("q"), install: Some("curl -fsSL https://d1.awsstatic.com/amazon-q/Amazon%20Q%20Developer%20CLI/Linux/latest/q.tar.gz -o /tmp/q.tar.gz && mkdir -p ~/.local/bin && tar -xzf /tmp/q.tar.gz -C ~/.local/bin && rm /tmp/q.tar.gz"), logo: svg!("amazonq.svg") },
+    Agent { id: "openinterpreter", name: "Open Interpreter", bin: Some("interpreter"), install: Some("curl -fsSL https://www.openinterpreter.com/install | sh"), logo: svg!("openinterpreter.svg") },
+    Agent { id: "codewhale", name: "CodeWhale", bin: Some("codewhale"), install: Some("npm install -g codewhale"), logo: svg!("codewhale.svg") },
+    Agent { id: "dexto", name: "Dexto", bin: Some("dexto"), install: Some("npm install -g dexto"), logo: svg!("dexto.svg") },
+    Agent { id: "trae", name: "Trae Agent", bin: Some("trae-agent"), install: Some("pip install trae-agent"), logo: svg!("trae.png") },
+    Agent { id: "sweagent", name: "SWE-agent", bin: Some("swe-agent"), install: Some("pip install swe-agent"), logo: svg!("sweagent.svg") },
+    Agent { id: "forgecode", name: "ForgeCode", bin: Some("forge"), install: Some("curl -fsSL https://forgecode.dev/cli | sh"), logo: svg!("forgecode.svg") },
+    Agent { id: "opensquilla", name: "OpenSquilla", bin: Some("opensquilla"), install: Some("pip install opensquilla"), logo: svg!("opensquilla.png") },
+    Agent { id: "everycode", name: "Every Code", bin: Some("code"), install: Some("npm install -g @every-code/cli"), logo: svg!("everycode.png") },
+    Agent { id: "nanocoder", name: "Nanocoder", bin: Some("nanocoder"), install: Some("npm install -g @nanocollective/nanocoder"), logo: svg!("nanocoder.png") },
+    Agent { id: "claudin", name: "Claudin", bin: Some("claudin"), install: Some("npm install -g @claudiolabs/claudin"), logo: svg!("claudin.png") },
+    Agent { id: "primeagent", name: "Prime Agent", bin: Some("prime-agent"), install: Some("curl -sL https://app.primeintellect.ai/prime-agent/install.sh | bash"), logo: svg!("primeagent.svg") },
 ];
 
 /// Agent zum Namen eines laufenden Prozesses (z.B. `claude`, `.opencode`).
