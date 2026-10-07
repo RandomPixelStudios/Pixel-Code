@@ -2565,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "pixel-code"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "dirs",
  "eframe",

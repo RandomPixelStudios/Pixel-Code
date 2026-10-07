@@ -7,28 +7,26 @@ import { args, settings, fail, http, print, flags } from "./common.mjs";
 const base = (settings.url || "http://iobroker.local:8093").replace(/\/$/, "") + "/v1";
 const adapter = settings.instance || "vis-2.0";
 const headers = settings.user ? { Authorization: "Basic " + Buffer.from(`${settings.user}:${settings.password || ""}`).toString("base64") } : {};
-const path = (...p) => p.join("/").split("/").map(encodeURIComponent).join("/");
+// rest-api: /file/{objectId}/{fileName}, der Dateiname mit "/" als %2F in einem Segment
+const fileUrl = (name) => `${base}/file/${encodeURIComponent(adapter)}/${encodeURIComponent(name)}`;
 const [f, rest] = flags(args);
 const [cmd, ...a] = rest;
 
 const BACKUP = "vis-views.pixelcode-backup.json";
 
 async function readFile(name) {
-  return http("GET", `${base}/file/${path(adapter, name)}`, { headers });
+  return http("GET", fileUrl(name), { headers });
 }
 
-async function writeFile(name, content, type = "application/json") {
-  const form = new FormData();
-  form.append("file", new Blob([content], { type }), name.split("/").pop());
-  let res;
-  try { res = await fetch(`${base}/file/${path(adapter, name)}`, { method: "POST", headers, body: form }); } catch (e) { fail(`Request failed: ${e.cause?.message || e.message}`); }
-  if (!res.ok) fail(`HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+// Upload über writeFile64 (der Multipart-Upload unter /file nimmt keine Unterordner an)
+async function writeFile(name, content) {
+  await http("POST", `${base}/command/writeFile64`, { headers, body: { adapter, fileName: name, data64: Buffer.from(content).toString("base64") } });
 }
 
 /** Liest eine JSON-Datei, ohne bei Fehlern abzubrechen. */
 async function tryRead(name) {
   try {
-    const res = await fetch(`${base}/file/${path(adapter, name)}`, { headers });
+    const res = await fetch(fileUrl(name), { headers });
     return res.ok ? await res.json() : null;
   } catch { return null; }
 }
@@ -44,7 +42,7 @@ async function allTemplates(list) {
 }
 
 async function projects() {
-  const list = await http("GET", `${base}/dir/${path(adapter)}`, { headers });
+  const list = await http("GET", `${base}/dir/${encodeURIComponent(adapter)}`, { headers });
   return (Array.isArray(list) ? list : []).filter((e) => e.isDir).map((e) => e.file);
 }
 
@@ -77,6 +75,12 @@ const json = (s, what) => {
   if (s === undefined || s === true) return {};
   try { return JSON.parse(s); } catch (e) { fail(`--${what} is not valid JSON: ${e.message}`); }
 };
+
+const emptyView = (f) => ({
+  settings: { style: { background_class: "" }, theme: "redmond", sizex: f.width, sizey: f.height, useAsDefault: false },
+  widgets: {},
+  activeWidgets: {},
+});
 
 const px = (v) => (v === undefined ? undefined : /^\d+(\.\d+)?$/.test(String(v)) ? `${v}px` : String(v));
 
@@ -141,6 +145,15 @@ switch (cmd) {
     print(`Saved ${typeof f.view === "string" ? `view "${f.view}"` : "project"} in ${a[0]}. Backup: ${BACKUP}`);
     break;
   }
+  case "create-project": {
+    if (!a[0]) fail("Usage: create-project <name> [--view <first view>]");
+    if ((await projects()).includes(a[0])) fail(`Project "${a[0]}" already exists.`);
+    const first = typeof f.view === "string" ? f.view : "Main";
+    await writeFile(`${a[0]}/vis-views.json`, JSON.stringify({ ___settings: { folders: [], openedViews: [first] }, [first]: emptyView(f) }, null, 2));
+    await writeFile(`${a[0]}/vis-user.css`, "/* Project CSS */\n");
+    print(`Created project "${a[0]}" with view "${first}".`);
+    break;
+  }
   case "add-view": {
     if (!a[1]) fail("Usage: add-view <project> <name> [--from <view>] [--width 1280 --height 800]");
     const views = await load(a[0]);
@@ -155,11 +168,7 @@ switch (cmd) {
       }
       views[a[1]] = { ...src, widgets };
     } else {
-      views[a[1]] = {
-        settings: { style: { background_class: "" }, theme: "redmond", sizex: f.width, sizey: f.height, useAsDefault: false },
-        widgets: {},
-        activeWidgets: {},
-      };
+      views[a[1]] = emptyView(f);
     }
     await save(a[0], views);
     print(`Added view "${a[1]}".`);
@@ -226,11 +235,11 @@ switch (cmd) {
   case "css": {
     const name = `${need(a[0])}/vis-user.css`;
     if (!a[1]) {
-      const res = await fetch(`${base}/file/${path(adapter, name)}`, { headers }).catch(() => null);
+      const res = await fetch(fileUrl(name), { headers }).catch(() => null);
       print(res?.ok ? await res.text() : "(no vis-user.css yet)");
       break;
     }
-    await writeFile(name, readFileSync(resolve(a[1]), "utf8"), "text/css");
+    await writeFile(name, readFileSync(resolve(a[1]), "utf8"));
     print(`Saved ${name}.`);
     break;
   }
@@ -250,6 +259,7 @@ switch (cmd) {
   }
   default: console.log(`Usage (VIS 2 projects in the ioBroker file storage, via the rest-api adapter):
   projects                                   list projects
+  create-project <name> [--view Main]        new project with one empty view
   views <project>                            views with their widgets (id, type, state, position)
   get <project> [view]                       raw JSON of the project or one view
   put <project> <file.json> [--view <name>]  write the whole project or replace one view
