@@ -2731,6 +2731,20 @@ fn install_mcp(agent: &str, bin: &str) {
             serde_json::json!({ "type": "local", "command": node_s, "args": [script_s], "tools": ["*"] }),
         ),
         "amp" => merge_json(&dirs::config_dir().unwrap_or(home.join(".config")).join("amp/settings.json"), "amp.mcpServers", stdio),
+        "crush" => merge_json(
+            &dirs::config_dir().unwrap_or(home.join(".config")).join("crush/crush.json"),
+            "mcp",
+            serde_json::json!({ "type": "stdio", "command": node_s, "args": [script_s] }),
+        ),
+        // Kilo CLI basiert auf OpenCode: "local"-Server mit Befehl als Liste
+        "kilo" => merge_json(
+            &dirs::config_dir().unwrap_or(home.join(".config")).join("kilo/kilo.json"),
+            "mcp",
+            serde_json::json!({ "type": "local", "command": [node_s, script_s], "enabled": true }),
+        ),
+        "iflow" => merge_json(&home.join(".iflow/settings.json"), "mcpServers", stdio),
+        "junie" => merge_json(&home.join(".junie/mcp/mcp.json"), "mcpServers", stdio),
+        "openhands" => merge_json(&home.join(".openhands/mcp.json"), "mcpServers", stdio),
         _ => {}
     }
 }
@@ -2843,6 +2857,15 @@ fn install_status_hooks(agent: &str, home: &std::path::Path) {
         ("PermissionRequest", "permission"),
         ("Stop", "done"),
     ];
+    const IFLOW: &[(&str, &str)] = &[
+        ("SessionStart", "idle"),
+        ("UserPromptSubmit", "working"),
+        ("PreToolUse", "tool"),
+        ("PostToolUse", "working"),
+        ("Notification", "notify"),
+        ("Stop", "done"),
+        ("SessionEnd", "idle"),
+    ];
     const GEMINI: &[(&str, &str)] = &[
         ("SessionStart", "idle"),
         ("BeforeAgent", "working"),
@@ -2857,6 +2880,7 @@ fn install_status_hooks(agent: &str, home: &std::path::Path) {
         "codex" => merge_hooks(&home.join(".codex/hooks.json"), CODEX, true),
         "gemini" => merge_hooks(&home.join(".gemini/settings.json"), GEMINI, false),
         "qwen" => merge_hooks(&home.join(".qwen/settings.json"), GEMINI, false),
+        "iflow" => merge_hooks(&home.join(".iflow/settings.json"), IFLOW, true),
         _ => {}
     }
 }

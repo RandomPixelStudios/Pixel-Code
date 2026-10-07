@@ -40,7 +40,7 @@ Recommends: nodejs, git, policykit-1 | pkexec, xdg-desktop-portal
 Maintainer: RandomPixelStudios <randompixxelstudios@gmail.com>
 Homepage: https://github.com/RandomPixelStudios/Pixel-Code
 Description: Terminal workspace for AI coding agents
- Pixel Code runs Claude Code, Codex, OpenCode, Gemini CLI and other coding
+ Pixel Code runs Claude Code, Codex, OpenCode, Gemini CLI, Crush, Kilo and other coding
  agents side by side, shows what each one is doing (working, question,
  permission, done) and connects them to plugins like GitHub, ioBroker,
  Home Assistant, Docker and many more.

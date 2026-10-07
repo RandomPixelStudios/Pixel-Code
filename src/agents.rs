@@ -6,7 +6,6 @@ use crate::theme;
 
 pub enum Logo {
     Svg(&'static str, &'static [u8]),
-    #[allow(dead_code)]
     /// Fallback ohne offizielles Logo: Monogramm auf farbiger Fläche.
     Mono(&'static str, Color32),
     Shell,
@@ -124,6 +123,12 @@ pub const AGENTS: &[Agent] = &[
     Agent { id: "grok", name: "Grok CLI", bin: Some("grok"), install: Some("npm install -g @vibe-kit/grok-cli"), logo: svg!("grok.svg") },
     Agent { id: "codebuddy", name: "CodeBuddy", bin: Some("codebuddy"), install: Some("npm install -g @tencent-ai/codebuddy-code"), logo: svg!("codebuddy-color.svg") },
     Agent { id: "codebuff", name: "Codebuff", bin: Some("codebuff"), install: Some("npm install -g codebuff"), logo: svg!("codebuff.png") },
+    Agent { id: "crush", name: "Crush", bin: Some("crush"), install: Some("npm install -g @charmland/crush"), logo: Logo::Mono("Cr", Color32::from_rgb(0x6B, 0x50, 0xFF)) },
+    Agent { id: "kilo", name: "Kilo Code CLI", bin: Some("kilo"), install: Some("npm install -g @kilocode/cli"), logo: svg!("kilocode.svg") },
+    Agent { id: "junie", name: "Junie CLI", bin: Some("junie"), install: Some("npm install -g @jetbrains/junie-cli"), logo: svg!("junie-color.svg") },
+    Agent { id: "letta", name: "Letta Code", bin: Some("letta"), install: Some("npm install -g @letta-ai/letta-code"), logo: Logo::Mono("L", Color32::from_rgb(0x1E, 0x1E, 0x2E)) },
+    Agent { id: "iflow", name: "iFlow CLI", bin: Some("iflow"), install: Some("npm install -g @iflow-ai/iflow-cli"), logo: Logo::Mono("iF", Color32::from_rgb(0x2F, 0x6B, 0xFF)) },
+    Agent { id: "openhands", name: "OpenHands CLI", bin: Some("openhands"), install: Some("uv tool install openhands --python 3.12"), logo: svg!("openhands-color.svg") },
 ];
 
 /// Agent zum Namen eines laufenden Prozesses (z.B. `claude`, `.opencode`).
