@@ -697,12 +697,13 @@ pub const DEFS: &[Def] = &[
     Def {
         id: "iobroker-vis",
         name: "ioBroker VIS 2",
-        description: "Build ioBroker VIS 2 visualizations: views, widgets and CSS through the rest-api adapter.",
-        usage: "'projects', 'views <project>', 'widgets', 'widget <tpl>', 'add-view <project> <name>', 'add-widget <project> <view> <tpl> --oid <state> --x --y --w --h', 'set-widget', 'del-widget', 'put <project> <file.json> [--view]', 'css <project> [file]', 'restore <project>', 'reload'",
+        description: "Build ioBroker VIS 2 visualizations: views, widgets, CSS, example states and screenshots through the rest-api adapter.",
+        usage: "'projects', 'views <project>', 'widgets', 'widget <tpl>', 'add-view <project> <name>', 'add-widget <project> <view> <tpl> --oid <state> --x --y --w --h', 'set-widget', 'del-widget', 'put <project> <file.json> [--view]', 'css <project> [file]', 'restore <project>', 'reload', 'screenshot <project> [view] [file.png] [--dark] [--width]', 'states <pattern>', 'create-state <id> [value]', 'create-states <file.json>', 'set-state <id> <value>'",
         logo: logo!("iobroker.svg"),
         fields: &[
             field("url", "rest-api URL", "http://iobroker.local:8093", false),
             field("instance", "VIS instance (optional)", "vis-2.0", false),
+            field("web", "VIS web URL (optional)", "for screenshots, default: same host on port 8082", false),
             field("user", "User (optional)", "only if authentication is enabled", false),
             field("password", "Password (optional)", "", true),
         ],
